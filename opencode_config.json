@@ -1,0 +1,13 @@
+{
+  "permission": {
+    "edit": "allow",
+    "bash": "deny",
+    "write": "allow",
+    "read": "allow",
+    "external_directory": "deny",
+    "doom_loop": "allow"
+  },
+  "skills": {
+    "paths": ["/tmp/sm_demo/skills"]
+  }
+}
