@@ -235,7 +235,12 @@ func (sm *SessionManager) Create(ctx context.Context, req models.CreateSessionRe
 	if model == "" {
 		model = sm.cfg.DefaultModel
 	}
-	model = strings.Replace(model, "deepseek/", "team-deepseek/", 1)
+	switch model {
+	case "hy3/hy3-preview":
+		model = "opencode/big-pickle"
+	default:
+		model = strings.Replace(model, "deepseek/", "team-deepseek/", 1)
+	}
 
 	task, isNew, err := sm.store.GetOrCreateTask(req.TaskID, req.Topic, req.UID, req.MemoryModel, req.Platform, req.SkillID, model, req.AccountID)
 	if err != nil {
@@ -406,10 +411,15 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 	msgCount := 0
 	totalTokens := 0
 	capturedSID := ocSID
+	var textBuf strings.Builder
 
 	for evt := range events {
 		evt.SessionID = sessionID
 		evt.TaskID = taskID
+
+		if evt.Type == "token" {
+			textBuf.WriteString(evt.Text)
+		}
 
 		if evt.Type == "step_start" && capturedSID == "" {
 			sess, err := sm.store.GetSession(taskID, sessionID)
@@ -422,13 +432,34 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 			totalTokens += evt.Tokens.Total
 		}
 
-		if evt.Type == "tool_call" && evt.DraftPath != "" {
+		if evt.Type == "tool_call" && evt.DraftPath != "" && evt.ToolResult != "" {
 			sm.broadcast(sessionID, models.SessionEvent{
 				Type:      "draft_updated",
 				SessionID: sessionID,
 				TaskID:    taskID,
 				DraftPath: evt.DraftPath,
 			})
+		}
+
+		if (evt.Type == "step_finish" || evt.Type == "done") && textBuf.Len() > 0 {
+			cwd := sm.store.GetSessionCWDDir(taskID, sessionID)
+			draftPath := filepath.Join(cwd, "current_draft.md")
+			newContent := []byte(textBuf.String())
+			// 不覆盖更长的已有内容（AI 可能在后续回复中输出短确认消息，覆盖掉已写好的章节正文）
+			write := true
+			if existing, err := os.ReadFile(draftPath); err == nil && len(existing) > len(newContent) {
+				write = false
+			}
+			if write {
+				if err := os.WriteFile(draftPath, newContent, 0644); err == nil {
+					sm.broadcast(sessionID, models.SessionEvent{
+						Type:      "draft_updated",
+						SessionID: sessionID,
+						TaskID:    taskID,
+						DraftPath: draftPath,
+					})
+				}
+			}
 		}
 
 		if evt.Type == "token" || evt.Type == "tool_call" || evt.Type == "step_finish" ||
@@ -465,8 +496,9 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 		}
 
 		if sess.MessageCount >= sm.cfg.MaxMessagesPerEpoch || sess.TotalTokens >= sm.cfg.MaxTokensPerEpoch {
-			log.Printf("session %s reached archive threshold: msgs=%d tokens=%d",
+			log.Printf("session %s reached archive threshold: msgs=%d tokens=%d, auto-archiving",
 				sessionID, sess.MessageCount, sess.TotalTokens)
+			sm.Close(context.Background(), sessionID)
 		}
 	}
 
@@ -903,6 +935,10 @@ func (sm *SessionManager) UpdateTaskFields(taskID, novelName, accountID string, 
 		task.PublishedChapterCount += chapterCountDelta
 	}
 	return sm.store.UpdateTask(task)
+}
+
+func (sm *SessionManager) DeleteTask(taskID string) error {
+	return sm.store.DeleteTask(taskID)
 }
 
 func min(a, b int) int {

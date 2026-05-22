@@ -21,103 +21,96 @@ type SkillDef struct {
 }
 
 var PrebuiltSkills = map[string]SkillDef{
-	"xhs_grass_v1": {
-		ID:               "xhs_grass_v1",
-		Name:             "小红书种草 v1",
-		Description:      "适合美食/生活种草场景，俏皮活泼、第一人称、300-500字",
-		Category:         "preset",
-		ModelRecommended: "deepseek-chat",
-		TargetPlatforms:  []string{"xhs"},
-		StyleRules: []string{
-			"使用俏皮、活泼、第一人称的写作风格",
-			"每段不超过3行，多使用短句",
-			"必须包含2-5个emoji，自然嵌入句子中",
-			"开头要用吸引眼球的hook（一句话抓住读者）",
-			"结尾要有互动引导（如'你们觉得呢？'）",
-		},
-		Constraints: []string{
-			"字数控制在300-500字",
-			"不得使用过于夸张的宣传用语",
-			"不得贬低竞争对手",
-		},
-		OutputSchema: `{
-  "type": "object",
-  "required": ["title", "content", "tags"],
-  "properties": {
-    "title": {"type": "string", "minLength": 5, "maxLength": 30},
-    "content": {"type": "string", "minLength": 100, "maxLength": 800},
-    "tags": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 10}
-  }
-}`,
-	},
-
-	"wechat_deep_v1": {
-		ID:               "wechat_deep_v1",
-		Name:             "公众号深度长文 v1",
-		Description:      "适合公众号深度内容，专业有料、娓娓道来、1500-3000字",
-		Category:         "preset",
-		ModelRecommended: "deepseek-reasoner",
-		TargetPlatforms:  []string{"wechat"},
-		StyleRules: []string{
-			"使用专业但不枯燥的写作风格",
-			"每段控制5-8行，逻辑层次清晰",
-			"多用小标题分段，结构分明",
-			"引用数据或案例增强说服力",
-			"开头要有场景感，让读者有代入感",
-		},
-		Constraints: []string{
-			"字数控制在1500-3000字",
-			"必须包含至少3个小标题",
-			"结尾要有总结和读者互动",
-		},
-	},
-
 	"general_fallback_v1": {
 		ID:               "general_fallback_v1",
-		Name:             "通用兜底 v1",
-		Description:      "通用写作风格，适用于各种场景",
+		Name:             "通用创作 v1",
+		Description:      "通用小说创作风格，支持言情、玄幻、都市、悬疑等多种类型，自动识别用户需求并选择合适的写作方式，不少于2000字",
 		Category:         "preset",
 		ModelRecommended: "deepseek-chat",
 		TargetPlatforms:  []string{"general"},
 		StyleRules: []string{
-			"使用清晰、友好的写作风格",
-			"根据用户需求灵活调整格式",
+			"根据用户提供的分类、主题、角色、情节自动判断小说类型，匹配合适的写作风格",
+			"言情类：注重情感渲染、人物内心独白、细腻的情感转折，使用温和细腻的文笔",
+			"玄幻/仙侠类：注重世界观构建、战斗场面描写、修炼体系逻辑，文风偏大气磅礴",
+			"都市/现实类：贴近生活、语言口语化自然、注重人物关系和社会背景",
+			"悬疑/推理类：线索铺设隐蔽、节奏紧凑、反转设计巧妙、氛围营造到位",
+			"开篇必须有钩子，快速抓住读者注意力",
+			"每章至少包含1个爽点或爆点（打脸、突破、反转、获得机缘等）",
+			"使用第三人称叙事，注重场景描写、人物心理活动和细节刻画",
 		},
 		Constraints: []string{
+			"正文字数控制在1000-1500字",
 			"输出格式为Markdown",
-		},
-	},
-
-	"wechat_versailles_v1": {
-		ID:               "wechat_versailles_v1",
-		Name:             "朋友圈凡尔赛文学 v1",
-		Description:      "适合朋友圈/社交媒体凡尔赛风格文学创作，表面抱怨实则炫耀，看似随意实则精心设计，200-500字",
-		Category:         "preset",
-		ModelRecommended: "deepseek-chat",
-		TargetPlatforms:  []string{"moment"},
-		StyleRules: []string{
-			"表面抱怨，实质炫耀：以抱怨为外衣包裹炫耀内核",
-			"不经意地提及高端品牌/地名/人物，仿佛它们只是生活背景",
-			"使用第三人称视角夸自己，借他人之口显得更客观",
-			"自嘲式凡尔赛：假装自嘲，实则展示优越",
-			"反差制造戏剧性：用'穷人烦恼'反衬富裕生活",
-			"使用第一人称'我'，语气自然随意像真的在发朋友圈",
-			"开头用叹词制造真实感（好烦啊/救命/真的受不了）",
-			"结尾留一个'朴实无华'的收尾，制造反差",
-		},
-		Constraints: []string{
-			"字数控制在200-500字，不超过6句",
-			"必须包含至少3个隐藏炫耀点",
-			"炫耀点要藏得住，不能过于直白",
-			"整体语气要让人又爱又恨、想点赞又想屏蔽",
-			"可以适当使用emoji但不超过3个",
 		},
 		OutputSchema: `{
   "type": "object",
-  "required": ["moment_text", "hidden_bragging_points"],
+  "required": ["content"],
   "properties": {
-    "moment_text": {"type": "string", "minLength": 100, "maxLength": 600},
-    "hidden_bragging_points": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5}
+    "content": {"type": "string", "minLength": 1000, "maxLength": 3000}
+  }
+}`,
+	},
+
+	"my-novel-writer": {
+		ID:               "my-novel-writer",
+		Name:             "小说写手",
+		Description:      "辅助创作长篇小说的智能助手，支持人物设定、世界观管理、大纲控制和分章生成",
+		Category:         "custom",
+		ModelRecommended: "deepseek-chat",
+		TargetPlatforms:  []string{"fanqie", "novel"},
+		StyleRules: []string{
+			"根据用户提供的人物设定、世界观、大纲进行小说章节创作",
+			"每章字数控制在2200-2500字，确保逻辑连贯、风格统一",
+			"保持人物性格一致，世界观设定自洽",
+			"合理运用伏笔，在后续章节回收",
+			"使用第三人称叙事，注重场景描写和人物心理活动",
+		},
+		Constraints: []string{
+			"章节正文控制在1000-1500字",
+			"严格遵循已有的人物设定和世界观",
+			"输出格式为Markdown，禁止在正文前输出标题",
+			"每章末尾添加引导读者互动的内容",
+		},
+		OutputSchema: `{
+  "type": "object",
+  "required": ["chapter_title", "content"],
+  "properties": {
+    "chapter_title": {"type": "string", "minLength": 2, "maxLength": 50},
+    "content": {"type": "string", "minLength": 1000, "maxLength": 3000},
+    "summary": {"type": "string", "minLength": 10, "maxLength": 200},
+    "characters_appeared": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 10},
+    "foreshadowing": {"type": "array", "items": {"type": "string"}, "minItems": 0, "maxItems": 5}
+  }
+}`,
+	},
+
+	"novel_title_gen": {
+		ID:               "novel_title_gen",
+		Name:             "小说书名生成",
+		Description:      "根据小说分类、主题、角色、情节，生成3-5个候选书名，覆盖悬念、诗意、直白等不同风格",
+		Category:         "custom",
+		ModelRecommended: "deepseek-chat",
+		TargetPlatforms:  []string{"fanqie", "novel"},
+		StyleRules: []string{
+			"分析用户提供的小说分类、主题、角色、情节，提炼最核心的卖点和亮点",
+			"核心梗概前置：将故事最核心、最新颖的设定直接做进书名里，一眼吸睛",
+			"强烈情绪与风格化：轻松幽默的口语化书名，或深沉严肃的格调类书名",
+			"反差感与冲突感：通过身份、行为或环境的强烈反差制造吸引力",
+			"覆盖3种以上取名风格：悬念类、诗意类、直白爽点类",
+			"避免使用烂大街的取名模板如总裁的XXX、废柴逆天、绝世无双、重生之XXX",
+		},
+		Constraints: []string{
+			"生成3-5个候选书名",
+			"每个书名不超过15个字",
+			"每个书名下方附一行简短说明，解释该书名吸引读者的亮点",
+			"书名与用户提供的小说信息强相关，不得生成无关书名",
+			"书名必须原创，不得抄袭现有知名作品的书名",
+		},
+		OutputSchema: `{
+  "type": "object",
+  "required": ["content"],
+  "properties": {
+    "content": {"type": "string", "minLength": 100, "maxLength": 3000}
   }
 }`,
 	},
@@ -141,7 +134,7 @@ var PrebuiltSkills = map[string]SkillDef{
 		Constraints: []string{
 			"不得偏离已有角色人设（性格、说话方式、行为模式）",
 			"所有设定以原文为准，不可自行编造关键设定",
-			"续写章节长度控制在2000-4000字",
+			"续写章节正文字数不少于2000字",
 			"使用第三人称限知视角（默认，如原文另有设定则跟随原文）",
 			"不得引入过多新角色（每章最多1个）",
 			"输出格式为Markdown，但不要在正文开头写章节标题（如'第X章 XXX'），章节标题单独填写在 chapter_title 字段中",
@@ -151,7 +144,7 @@ var PrebuiltSkills = map[string]SkillDef{
   "required": ["chapter_title", "content", "plot_updates"],
   "properties": {
     "chapter_title": {"type": "string", "minLength": 2, "maxLength": 50},
-    "content": {"type": "string", "minLength": 500, "maxLength": 5000},
+    "content": {"type": "string", "minLength": 2000, "maxLength": 8000},
     "plot_updates": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 10}
   }
 }`,
@@ -245,6 +238,16 @@ func BuildInitialMessage(topic string, skill SkillDef) string {
 	sb.WriteString("## 任务主题\n\n")
 	sb.WriteString(fmt.Sprintf("%s\n\n", topic))
 
+	if skill.ID == "my-novel-writer" {
+		sb.WriteString("## 小说创作框架\n\n")
+		sb.WriteString("在开始写作之前，请先在 decisions.md 中建立以下框架：\n\n")
+		sb.WriteString("1. **人物设定**：根据用户输入的主题和角色信息，列出主要人物（姓名、身份、性格、动机），不少于2个角色\n")
+		sb.WriteString("2. **世界观设定**：根据用户输入的主题，构建故事发生的世界背景（时代、规则、势力等）\n")
+		sb.WriteString("3. **章节大纲**：为本次创作规划3-5章的简易大纲（每章一句话梗概即可），写入 decisions.md\n\n")
+		sb.WriteString("完成框架后，根据大纲生成第1章正文。\n")
+		sb.WriteString("正文开头不允许出现章节标题（如'第1章 XXX'），章节标题应单独填写在 JSON 的 chapter_title 字段中。\n\n")
+	}
+
 	sb.WriteString("## 风格要求\n\n")
 	for i, rule := range skill.StyleRules {
 		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, rule))
@@ -285,6 +288,15 @@ func BuildWakeMessage(topic string, skill SkillDef, userText string, hasShortTer
 	} else if hasMediumTerm {
 		sb.WriteString("## 历史上下文\n\n")
 		sb.WriteString("工作目录下有历史摘要文件 **HISTORY_SUMMARY.md**，请仔细阅读后基于它继续创作。\n\n")
+	}
+
+	if skill.ID == "my-novel-writer" {
+		sb.WriteString("## 分章续写指引\n\n")
+		sb.WriteString("1. 先读取 RECENT_DRAFTS.md 和 HISTORY_SUMMARY.md，确认上一章的剧情终点和人物状态\n")
+		sb.WriteString("2. 读取 decisions.md（如果存在），确认之前设定的人物、世界观和大纲\n")
+		sb.WriteString("3. 根据大纲判断当前应写第几章，从上一次结束的地方无缝衔接继续\n")
+		sb.WriteString("4. 续写新章节时，保持人物性格一致、世界观自洽、伏笔逐步回收\n")
+		sb.WriteString("5. 正文开头不允许出现章节标题（如'第X章 XXX'），章节标题应单独填写在 JSON 的 chapter_title 字段中\n\n")
 	}
 
 	if userText != "" {

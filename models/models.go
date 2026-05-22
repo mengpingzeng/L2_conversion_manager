@@ -100,6 +100,7 @@ type CreateSessionRequest struct {
 	AccountID    string `json:"account_id"`
 	InitialMsg   string `json:"initial_msg,omitempty"`
 	DraftVersion int    `json:"draft_version"`
+	NovelName    string `json:"novel_name,omitempty"`
 }
 
 type SendMessageRequest struct {

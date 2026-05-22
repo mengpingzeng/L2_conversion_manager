@@ -50,6 +50,7 @@ func (s *Server) registerRoutes() {
 	api.HandleFunc("/task/{id}/wake", s.handleTaskWake).Methods("POST")
 	api.HandleFunc("/task/{id}/update", s.handleTaskUpdate).Methods("POST")
 	api.HandleFunc("/task/{id}/sessions", s.handleTaskSessions).Methods("GET")
+	api.HandleFunc("/task/{id}", s.handleTaskDelete).Methods("DELETE")
 
 	api.HandleFunc("/session/create", s.handleCreate).Methods("POST")
 	api.HandleFunc("/session/{id}/send", s.handleSend).Methods("POST")
@@ -171,6 +172,15 @@ func (s *Server) handleTaskUpdate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "updated"})
 }
 
+func (s *Server) handleTaskDelete(w http.ResponseWriter, r *http.Request) {
+	taskID := mux.Vars(r)["id"]
+	if err := s.sm.DeleteTask(taskID); err != nil {
+		writeError(w, 500, "failed to delete task: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "deleted"})
+}
+
 func (s *Server) handleTaskSessions(w http.ResponseWriter, r *http.Request) {
 	taskID := mux.Vars(r)["id"]
 	sessions, err := s.sm.ListSessions(taskID)
@@ -219,6 +229,10 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 		writeError(w, 500, "failed to create session: "+err.Error())
 		return
+	}
+
+	if req.NovelName != "" {
+		_ = s.sm.UpdateTaskFields(req.TaskID, req.NovelName, "", 0)
 	}
 
 	writeJSON(w, 201, map[string]interface{}{

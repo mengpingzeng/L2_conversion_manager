@@ -189,6 +189,19 @@ func (s *Store) UpdateTask(t *models.Task) error {
 	return s.saveTasks()
 }
 
+func (s *Store) DeleteTask(taskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.tasks, taskID)
+	if err := s.saveTasks(); err != nil {
+		return err
+	}
+	// 删除任务目录（包含 sessions、drafts 等）
+	taskDir := filepath.Join(s.dataDir, "tasks", taskID)
+	_ = os.RemoveAll(taskDir)
+	return nil
+}
+
 func (s *Store) ListTasks() []*models.Task {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
