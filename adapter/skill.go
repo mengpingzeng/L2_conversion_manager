@@ -37,15 +37,25 @@ var PrebuiltSkills = map[string]SkillDef{
 			"开篇必须有钩子，快速抓住读者注意力",
 			"每章至少包含1个爽点或爆点（打脸、突破、反转、获得机缘等）",
 			"使用第三人称叙事，注重场景描写、人物心理活动和细节刻画",
+			"章节标题规则（最高优先级）：每章必须生成一个有意义的章节名称（4-15字），体现本章核心看点或爽点；输出格式严格为 '# 第X章 章节名称'（一级标题，禁止用 ##）；绝对禁止只写 '# 第X章' 不带名称，例如正确：'# 第1章 重生之始'，错误：'# 第1章'；章节标题填入 JSON 的 chapter_title 字段",
+			"续写模式检测：如果工作目录下存在 RECENT_DRAFTS.md 文件，说明这是续写任务，必须先使用 read 工具完整阅读 RECENT_DRAFTS.md，提取以下关键信息后基于它续写——a) 上一章的章节编号 b) 章节标题格式 c) 已出现的所有人物名称、身份、关系 d) 剧情进展和上一章结尾处的具体情节 e) 已铺设但尚未回收的伏笔",
+			"章节编号规则：续写时输出章节编号为 RECENT_DRAFTS.md 中最后一章编号 +1（如末章为第3章则续写第4章）；新建任务时输出第1章",
+			"人物一致性（续写）：所有已出现的人物名称、性格、关系必须与 RECENT_DRAFTS.md 完全一致，禁止改名或替换，新增角色需与已有世界观及剧情兼容",
+			"情节衔接（续写）：续写内容必须从上一章的剧情结尾处无缝衔接，承接已有的冲突和伏笔，保持世界观设定的一致性",
+			"风格延续（续写）：保持与 RECENT_DRAFTS.md 中文风的一致性，包括句式、用词、叙事节奏、对话风格",
 		},
 		Constraints: []string{
 			"正文字数控制在1000-1500字",
 			"输出格式为Markdown",
+			"每章开头必须输出章节标题 '# 第X章 章节名称'（一级标题，禁止 ##），标题后紧跟正文内容。名称必填，不可只有章节号",
+			"章节标题必须与当前章节内容强相关，体现本章的核心情节或爽点",
+			"续写任务：人物名称必须与 RECENT_DRAFTS.md 中完全一致，不得修改任何已有人物的姓名",
 		},
 		OutputSchema: `{
   "type": "object",
-  "required": ["content"],
+  "required": ["chapter_title", "content"],
   "properties": {
+    "chapter_title": {"type": "string", "minLength": 4, "maxLength": 50},
     "content": {"type": "string", "minLength": 1000, "maxLength": 3000}
   }
 }`,
@@ -262,7 +272,7 @@ func BuildInitialMessage(topic string, skill SkillDef) string {
 
 	sb.WriteString("## 硬性约束（最重要！）\n\n")
 	sb.WriteString("1. 回复完成后，你必须使用 write 工具将完整内容写入 current_draft.md 文件。这是必须执行的步骤！\n")
-	sb.WriteString("2. 文件路径使用绝对路径或相对于工作目录的路径 current_draft.md\n\n")
+	sb.WriteString("2. 章节标题作为 Markdown 一级标题（如 '# 第1章 重回少年时'）写在 current_draft.md 最开头\n\n")
 
 	sb.WriteString("## 输出格式\n\n")
 	sb.WriteString("请先直接输出文案正文，然后再使用 write 工具保存到 current_draft.md。\n\n")
@@ -271,10 +281,16 @@ func BuildInitialMessage(topic string, skill SkillDef) string {
 	return sb.String()
 }
 
-func BuildWakeMessage(topic string, skill SkillDef, userText string, hasShortTerm, hasMediumTerm bool) string {
+func BuildWakeMessage(topic string, skill SkillDef, userText string, hasShortTerm, hasMediumTerm bool, chapterNumber int) string {
 	var sb strings.Builder
 
-	sb.WriteString("# 任务恢复：继续创作\n\n")
+	sb.WriteString("# ⚠️ 续写任务 — 禁止重新开始\n\n")
+	sb.WriteString("这是对已有小说的续写操作，不是新建任务。你必须基于前文内容继续推进剧情。\n\n")
+	sb.WriteString("## 红线禁令（违反将导致内容作废）\n\n")
+	sb.WriteString("1. **禁止创建全新故事**：不得另起炉灶，不得更换世界观或故事背景\n")
+	sb.WriteString("2. **禁止更换主角**：已有主角的姓名、身份、性格必须与前文完全一致\n")
+	sb.WriteString(fmt.Sprintf("3. **本次续写章节编号**：第 %d 章（不得使用其他编号）\n", chapterNumber))
+	sb.WriteString("4. **禁止忽略前文**：必须先使用 read 工具完整阅读 RECENT_DRAFTS.md\n\n")
 	sb.WriteString(fmt.Sprintf("你正在继续处理任务：%s\n\n", topic))
 
 	if hasShortTerm && hasMediumTerm {
@@ -297,6 +313,19 @@ func BuildWakeMessage(topic string, skill SkillDef, userText string, hasShortTer
 		sb.WriteString("3. 根据大纲判断当前应写第几章，从上一次结束的地方无缝衔接继续\n")
 		sb.WriteString("4. 续写新章节时，保持人物性格一致、世界观自洽、伏笔逐步回收\n")
 		sb.WriteString("5. 正文开头不允许出现章节标题（如'第X章 XXX'），章节标题应单独填写在 JSON 的 chapter_title 字段中\n\n")
+	}
+
+	if skill.ID == "general_fallback_v1" {
+		sb.WriteString("## 续写操作步骤（必须严格执行）\n\n")
+		sb.WriteString("1. **第一步：阅读前文**。使用 read 工具读取 RECENT_DRAFTS.md 完整内容，不能跳过\n")
+		sb.WriteString("2. **第二步：提取前文信息**——\n")
+		sb.WriteString("   - 所有已出现人物的姓名、身份、性格和人物关系（禁止修改任何一个）\n")
+		sb.WriteString("   - 上一章结尾的剧情状态、未解决的冲突、已铺设的伏笔\n")
+		sb.WriteString("   - 前文的写作风格、用词习惯、叙事节奏\n")
+		sb.WriteString(fmt.Sprintf("3. **第三步：生成第 %d 章**。根据本章核心内容，生成一个 4-15 字的章节标题，格式 '# 第%d章 章节名称'\n", chapterNumber, chapterNumber))
+		sb.WriteString("4. **第四步：无缝续写**。从上一章结尾处直接衔接，承接冲突和伏笔，推进剧情\n")
+		sb.WriteString("5. 章节标题写在 current_draft.md 最开头，标题后紧跟正文\n")
+		sb.WriteString("6. 人物名称、性格、关系必须与 RECENT_DRAFTS.md 完全一致，不得修改或替换\n\n")
 	}
 
 	if userText != "" {

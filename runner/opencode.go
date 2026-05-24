@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -66,6 +68,9 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 		defer close(events)
 		defer w.close()
 
+		var textBuf strings.Builder
+		hasWrite := false
+
 		args := r.buildArgs(opts)
 
 		cmd := exec.CommandContext(ctx, r.binaryPath, args...)
@@ -79,6 +84,9 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 
 		if opts.ConfigPath != "" {
 			cmd.Env = append(os.Environ(), "OPENCODE_CONFIG="+opts.ConfigPath)
+		}
+		if opts.DeepseekAPIKey != "" {
+			cmd.Env = append(cmd.Env, "DEEPSEEK_API_KEY="+opts.DeepseekAPIKey)
 		}
 
 		stdout, err := cmd.StdoutPipe()
@@ -108,8 +116,9 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 		}
 
 		go func() {
-			scanner := bufio.NewScanner(stderr)
-			for scanner.Scan() {
+			sc := bufio.NewScanner(stderr)
+			for sc.Scan() {
+				log.Printf("[opencode stderr] %s", sc.Text())
 			}
 		}()
 
@@ -127,7 +136,15 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 
 			evt, err := parseOpenCodeEvent(line, capturedSID)
 			if err != nil {
+				log.Printf("[opencode parse] failed to parse line (len=%d, SID=%s): %v", len(line), capturedSID, err)
 				continue
+			}
+
+			if evt.Type == "token" && evt.Text != "" {
+				textBuf.WriteString(evt.Text)
+			}
+			if evt.Type == "tool_call" && isWriteTool(evt.Tool) {
+				hasWrite = true
 			}
 
 			if capturedSID == "" && evt.SessionID != "" {
@@ -140,6 +157,10 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 			evt.Seq = seq
 			seq++
 			w.send(evt)
+		}
+
+		if err := scanner.Err(); err != nil {
+			log.Printf("[opencode stdout] scanner error (SID=%s): %v", capturedSID, err)
 		}
 
 		if err := cmd.Wait(); err != nil {
@@ -158,6 +179,16 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 			}
 		}
 
+		if !hasWrite && textBuf.Len() > 0 {
+			draftPath := filepath.Join(opts.CWD, "current_draft.md")
+			if err := os.WriteFile(draftPath, []byte(textBuf.String()), 0644); err == nil {
+				w.send(models.SessionEvent{
+					Type:      "draft_updated",
+					SessionID: capturedSID,
+				})
+			}
+		}
+
 		w.send(models.SessionEvent{
 			Type:      "done",
 			SessionID: capturedSID,
@@ -168,12 +199,13 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 }
 
 type RunOptions struct {
-	CWD        string
-	Model      string
-	SessionID  string
-	Message    string
-	Timeout    time.Duration
-	ConfigPath string
+	CWD            string
+	Model          string
+	SessionID      string
+	Message        string
+	Timeout        time.Duration
+	ConfigPath     string
+	DeepseekAPIKey string
 }
 
 func (r *OpenCodeRunner) buildArgs(opts RunOptions) []string {

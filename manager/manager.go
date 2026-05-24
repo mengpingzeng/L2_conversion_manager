@@ -29,6 +29,7 @@ type Config struct {
 	MaxMessagesPerEpoch int
 	MaxTokensPerEpoch   int
 	StaleTimeoutMin     int
+	DeepseekAPIKey      string
 }
 
 func DefaultConfig() Config {
@@ -235,11 +236,14 @@ func (sm *SessionManager) Create(ctx context.Context, req models.CreateSessionRe
 	if model == "" {
 		model = sm.cfg.DefaultModel
 	}
+	model = strings.TrimPrefix(model, "team-")
 	switch model {
 	case "hy3/hy3-preview":
 		model = "opencode/big-pickle"
 	default:
-		model = strings.Replace(model, "deepseek/", "team-deepseek/", 1)
+		if !strings.HasPrefix(model, "team-deepseek/") {
+			model = strings.Replace(model, "deepseek/", "team-deepseek/", 1)
+		}
 	}
 
 	task, isNew, err := sm.store.GetOrCreateTask(req.TaskID, req.Topic, req.UID, req.MemoryModel, req.Platform, req.SkillID, model, req.AccountID)
@@ -304,15 +308,29 @@ func (sm *SessionManager) Create(ctx context.Context, req models.CreateSessionRe
 	}
 	_ = sm.store.UpdateTask(task)
 
-	hasContext := sm.store.HasTaskContext(req.TaskID)
-	if !isNew && hasContext {
+	hasShort, hasMed := sm.store.HasTaskContext(req.TaskID)
+	if !isNew {
 		sm.injectTaskContext(cwd, req.TaskID)
+		if !hasShort {
+			if _, err := os.Stat(filepath.Join(cwd, "RECENT_DRAFTS.md")); err == nil {
+				hasShort = true
+			}
+		}
+		if !hasMed {
+			if _, err := os.Stat(filepath.Join(cwd, "HISTORY_SUMMARY.md")); err == nil {
+				hasMed = true
+			}
+		}
 	}
 
 	msg := req.InitialMsg
 	if msg == "" {
-		if !isNew && hasContext {
-			msg = adapter.BuildWakeMessage(req.Topic, skill, "", true, true)
+		if !isNew {
+			chapterNum := req.ChapterNumber
+			if chapterNum <= 0 {
+				chapterNum = task.SessionCount + 1
+			}
+			msg = adapter.BuildWakeMessage(req.Topic, skill, "", hasShort, hasMed, chapterNum)
 		} else {
 			msg = adapter.BuildInitialMessage(req.Topic, skill)
 		}
@@ -326,6 +344,31 @@ func (sm *SessionManager) Create(ctx context.Context, req models.CreateSessionRe
 func (sm *SessionManager) injectTaskContext(cwd, taskID string) {
 	shortData, errShort := sm.store.ReadShortTerm(taskID)
 	medData, errMed := sm.store.ReadMediumTerm(taskID)
+
+	if errShort != nil || len(shortData) == 0 {
+		sessions, err := sm.store.LoadTaskSessions(taskID)
+		if err == nil && len(sessions) > 0 {
+			var content string
+			start := 0
+			if len(sessions) > models.ShortTermWindowSize {
+				start = len(sessions) - models.ShortTermWindowSize
+			}
+			for i := start; i < len(sessions); i++ {
+				sess := sessions[i]
+				sessCwd := sm.store.GetSessionCWDDir(taskID, sess.SessionID)
+				draftPath := filepath.Join(sessCwd, "current_draft.md")
+				if data, err := os.ReadFile(draftPath); err == nil && len(data) > 0 {
+					content += fmt.Sprintf("## 章节 %d\n\n", i+1)
+					content += string(data)
+					content += "\n\n"
+				}
+			}
+			if len(content) > 0 {
+				shortData = []byte(content)
+				errShort = nil
+			}
+		}
+	}
 
 	if errShort == nil && len(shortData) > 0 {
 		path := filepath.Join(cwd, "RECENT_DRAFTS.md")
@@ -389,12 +432,13 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 	defer cancel()
 
 	opts := runner.RunOptions{
-		CWD:        cwd,
-		Model:      model,
-		SessionID:  ocSID,
-		Message:    message,
-		Timeout:    timeout,
-		ConfigPath: sm.configPath,
+		CWD:            cwd,
+		Model:          model,
+		SessionID:      ocSID,
+		Message:        message,
+		Timeout:        timeout,
+		ConfigPath:     sm.configPath,
+		DeepseekAPIKey: sm.cfg.DeepseekAPIKey,
 	}
 
 	events, err := sm.runner.Run(runCtx, opts)
@@ -414,6 +458,10 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 	var textBuf strings.Builder
 
 	for evt := range events {
+		if capturedSID == "" && evt.SessionID != "" && evt.SessionID != sessionID {
+			capturedSID = evt.SessionID
+		}
+
 		evt.SessionID = sessionID
 		evt.TaskID = taskID
 
@@ -421,9 +469,10 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 			textBuf.WriteString(evt.Text)
 		}
 
-		if evt.Type == "step_start" && capturedSID == "" {
+		if evt.Type == "step_start" && capturedSID != "" {
 			sess, err := sm.store.GetSession(taskID, sessionID)
 			if err == nil && sess.OpenCodeSID == "" {
+				sess.OpenCodeSID = capturedSID
 				_ = sm.store.UpsertSessionInTask(sess)
 			}
 		}
@@ -465,6 +514,19 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 		if evt.Type == "token" || evt.Type == "tool_call" || evt.Type == "step_finish" ||
 			evt.Type == "done" || evt.Type == "error" || evt.Type == "draft_updated" {
 			sm.broadcast(sessionID, evt)
+		}
+	}
+
+	sessionCwd := sm.store.GetSessionCWDDir(taskID, sessionID)
+	chkPath := filepath.Join(sessionCwd, "current_draft.md")
+	if data, err := os.ReadFile(chkPath); err == nil && len(data) > 0 {
+		firstLine := strings.TrimSpace(strings.SplitN(string(data), "\n", 2)[0])
+		if !strings.HasPrefix(firstLine, "# 第") || !strings.Contains(firstLine, "章") {
+			chapterNo := sm.inferChapterNumber(taskID)
+			newContent := fmt.Sprintf("# 第%d章\n\n%s", chapterNo, string(data))
+			if err := os.WriteFile(chkPath, []byte(newContent), 0644); err == nil {
+				log.Printf("[chapter-title] auto-fixed session=%s chapter=%d", sessionID, chapterNo)
+			}
 		}
 	}
 
@@ -618,12 +680,13 @@ func (sm *SessionManager) generateMediumSummary(taskID, sessionID string, task *
 	defer cancel()
 
 	opts := runner.RunOptions{
-		CWD:        tmpDir,
-		Model:      summaryModel,
-		SessionID:  "",
-		Message:    prompt,
-		Timeout:    120 * time.Second,
-		ConfigPath: sm.configPath,
+		CWD:            tmpDir,
+		Model:          summaryModel,
+		SessionID:      "",
+		Message:        prompt,
+		Timeout:        120 * time.Second,
+		ConfigPath:     sm.configPath,
+		DeepseekAPIKey: sm.cfg.DeepseekAPIKey,
 	}
 
 	events, err := sm.runner.Run(summaryCtx, opts)
@@ -753,10 +816,19 @@ func (sm *SessionManager) WakeTask(ctx context.Context, taskID string, req model
 	task.SessionCount = len(task.SessionIDs)
 	_ = sm.store.UpdateTask(task)
 
-	hasShort := sm.store.HasTaskContext(taskID)
-	hasMed := hasShort
+	hasShort, hasMed := sm.store.HasTaskContext(taskID)
+	if !hasShort {
+		if _, err := os.Stat(filepath.Join(cwd, "RECENT_DRAFTS.md")); err == nil {
+			hasShort = true
+		}
+	}
+	if !hasMed {
+		if _, err := os.Stat(filepath.Join(cwd, "HISTORY_SUMMARY.md")); err == nil {
+			hasMed = true
+		}
+	}
 
-	msg := adapter.BuildWakeMessage(task.Topic, skill, req.Text, hasShort, hasMed)
+	msg := adapter.BuildWakeMessage(task.Topic, skill, req.Text, hasShort, hasMed, task.SessionCount+1)
 
 	go sm.runSessionLoop(context.Background(), sessionID, taskID, cwd, model, msg, "")
 
@@ -783,6 +855,11 @@ func (sm *SessionManager) ListTasks() []models.TaskInfo {
 func (sm *SessionManager) ListTasksByUID(uid string) []models.TaskInfo {
 	tasks := sm.store.ListTasksByUID(uid)
 	return sm.tasksToInfo(tasks)
+}
+
+func (sm *SessionManager) ListTasksPage(uid, search string, page, size int) ([]models.TaskInfo, int) {
+	tasks, total := sm.store.ListTasksPage(uid, search, page, size)
+	return sm.tasksToInfo(tasks), total
 }
 
 func (sm *SessionManager) tasksToInfo(tasks []*models.Task) []models.TaskInfo {
@@ -812,6 +889,9 @@ func (sm *SessionManager) tasksToInfo(tasks []*models.Task) []models.TaskInfo {
 			NovelName:             t.NovelName,
 			AccountID:             t.AccountID,
 			PublishedChapterCount: t.PublishedChapterCount,
+			VolumeName:            t.VolumeName,
+			Title:                 t.Title,
+			ChapterNumber:         t.ChapterNumber,
 		})
 	}
 	return result
@@ -890,11 +970,16 @@ func (sm *SessionManager) Unsubscribe(sessionID string, ch chan models.SessionEv
 func (sm *SessionManager) broadcast(sessionID string, evt models.SessionEvent) {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
+	dropped := 0
 	for _, ch := range sm.subscribers[sessionID] {
 		select {
 		case ch <- evt:
 		default:
+			dropped++
 		}
+	}
+	if dropped > 0 {
+		log.Printf("[broadcast] session=%s type=%s 丢弃事件 %d 条（订阅者通道已满）", sessionID, evt.Type, dropped)
 	}
 }
 
@@ -920,7 +1005,7 @@ func stripMarkdownCodeFences(text string) string {
 	return strings.TrimSpace(text)
 }
 
-func (sm *SessionManager) UpdateTaskFields(taskID, novelName, accountID string, chapterCountDelta int) error {
+func (sm *SessionManager) UpdateTaskFields(taskID, novelName, accountID, volumeName, title string, chapterNumber int, chapterCountDelta int) error {
 	task, err := sm.store.GetTask(taskID)
 	if err != nil {
 		return err
@@ -931,6 +1016,15 @@ func (sm *SessionManager) UpdateTaskFields(taskID, novelName, accountID string, 
 	if accountID != "" {
 		task.AccountID = accountID
 	}
+	if volumeName != "" {
+		task.VolumeName = volumeName
+	}
+	if title != "" {
+		task.Title = title
+	}
+	if chapterNumber > 0 {
+		task.ChapterNumber = chapterNumber
+	}
 	if chapterCountDelta > 0 {
 		task.PublishedChapterCount += chapterCountDelta
 	}
@@ -939,6 +1033,21 @@ func (sm *SessionManager) UpdateTaskFields(taskID, novelName, accountID string, 
 
 func (sm *SessionManager) DeleteTask(taskID string) error {
 	return sm.store.DeleteTask(taskID)
+}
+
+func (sm *SessionManager) inferChapterNumber(taskID string) int {
+	task, err := sm.store.GetTask(taskID)
+	if err != nil {
+		return 1
+	}
+	if task.SessionCount > 0 {
+		return task.SessionCount
+	}
+	sessions, err := sm.store.LoadTaskSessions(taskID)
+	if err == nil && len(sessions) > 0 {
+		return len(sessions)
+	}
+	return 1
 }
 
 func min(a, b int) int {

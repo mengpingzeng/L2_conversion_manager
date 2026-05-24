@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -230,6 +232,45 @@ func (s *Store) ListTasksByUID(uid string) []*models.Task {
 	return result
 }
 
+// ListTasksPage 按创建时间倒序分页返回任务；uid 非空时仅返回该用户任务；search 按小说名模糊匹配。
+func (s *Store) ListTasksPage(uid, search string, page, size int) ([]*models.Task, int) {
+	if page < 1 {
+		page = 1
+	}
+	if size < 1 {
+		size = 12
+	}
+
+	var all []*models.Task
+	if uid != "" {
+		all = s.ListTasksByUID(uid)
+	} else {
+		all = s.ListTasks()
+	}
+
+	if search != "" {
+		q := strings.ToLower(strings.TrimSpace(search))
+		filtered := make([]*models.Task, 0, len(all))
+		for _, t := range all {
+			if strings.Contains(strings.ToLower(t.NovelName), q) {
+				filtered = append(filtered, t)
+			}
+		}
+		all = filtered
+	}
+
+	total := len(all)
+	start := (page - 1) * size
+	if start >= total {
+		return []*models.Task{}, total
+	}
+	end := start + size
+	if end > total {
+		end = total
+	}
+	return all[start:end], total
+}
+
 func (s *Store) LoadTaskSessions(taskID string) ([]*models.Session, error) {
 	path := s.TaskSessionsFile(taskID)
 	data, err := os.ReadFile(path)
@@ -400,15 +441,30 @@ func (s *Store) AppendMediumTerm(taskID, summary string) error {
 	return os.WriteFile(path, content, 0644)
 }
 
-func (s *Store) HasTaskContext(taskID string) bool {
+func (s *Store) HasTaskContext(taskID string) (bool, bool) {
 	dir := s.TaskMemoryDir(taskID)
 	shortPath := filepath.Join(dir, "short_term.md")
 	medPath := filepath.Join(dir, "medium_term.md")
 	_, errShort := os.Stat(shortPath)
 	_, errMed := os.Stat(medPath)
-	return errShort == nil || errMed == nil
+	return errShort == nil, errMed == nil
 }
 
 func (s *Store) EnsureTaskDirExists(taskID string) error {
 	return s.EnsureTaskDir(taskID)
+}
+
+var chapterPrefixRe = regexp.MustCompile(`^第[^\s章]+章\s*`)
+
+func ExtractChapterTitle(draft string) string {
+	lines := strings.SplitN(draft, "\n", 5)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "# ") {
+			title := strings.TrimPrefix(trimmed, "# ")
+			title = chapterPrefixRe.ReplaceAllString(title, "")
+			return title
+		}
+	}
+	return ""
 }

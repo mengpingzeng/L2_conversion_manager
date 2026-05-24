@@ -33,6 +33,9 @@ type Task struct {
 	NovelName             string    `json:"novel_name,omitempty"`
 	AccountID             string    `json:"account_id,omitempty"`
 	PublishedChapterCount int       `json:"published_chapter_count"`
+	VolumeName            string    `json:"volume_name,omitempty"`
+	Title                 string    `json:"title,omitempty"`
+	ChapterNumber         int       `json:"chapter_number"`
 }
 
 type Session struct {
@@ -90,17 +93,18 @@ type TokenInfo struct {
 }
 
 type CreateSessionRequest struct {
-	TaskID       string `json:"task_id"`
-	Topic        string `json:"topic"`
-	Platform     string `json:"platform"`
-	SkillID      string `json:"skill_id"`
-	Model        string `json:"model"`
-	MemoryModel  string `json:"memory_model"`
-	UID          string `json:"uid"`
-	AccountID    string `json:"account_id"`
-	InitialMsg   string `json:"initial_msg,omitempty"`
-	DraftVersion int    `json:"draft_version"`
-	NovelName    string `json:"novel_name,omitempty"`
+	TaskID        string `json:"task_id"`
+	Topic         string `json:"topic"`
+	Platform      string `json:"platform"`
+	SkillID       string `json:"skill_id"`
+	Model         string `json:"model"`
+	MemoryModel   string `json:"memory_model"`
+	UID           string `json:"uid"`
+	AccountID     string `json:"account_id"`
+	InitialMsg    string `json:"initial_msg,omitempty"`
+	DraftVersion  int    `json:"draft_version"`
+	NovelName     string `json:"novel_name,omitempty"`
+	ChapterNumber int    `json:"chapter_number,omitempty"`
 }
 
 type SendMessageRequest struct {
@@ -140,6 +144,9 @@ type TaskInfo struct {
 	NovelName             string    `json:"novel_name,omitempty"`
 	AccountID             string    `json:"account_id,omitempty"`
 	PublishedChapterCount int       `json:"published_chapter_count"`
+	VolumeName            string    `json:"volume_name,omitempty"`
+	Title                 string    `json:"title,omitempty"`
+	ChapterNumber         int       `json:"chapter_number"`
 }
 
 type TaskBusyError struct {

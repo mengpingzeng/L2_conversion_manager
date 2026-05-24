@@ -6,9 +6,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"session_manager/manager"
 	"session_manager/models"
+	"session_manager/store"
 
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
@@ -95,18 +97,28 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 
 func (s *Server) handleTaskList(w http.ResponseWriter, r *http.Request) {
 	uid := r.URL.Query().Get("uid")
-	var tasks []models.TaskInfo
-	if uid != "" {
-		tasks = s.sm.ListTasksByUID(uid)
-	} else {
-		tasks = s.sm.ListTasks()
+	search := r.URL.Query().Get("q")
+
+	page := 1
+	size := 12
+	if p := r.URL.Query().Get("page"); p != "" {
+		if v, err := strconv.Atoi(p); err == nil && v > 0 {
+			page = v
+		}
 	}
+	if sz := r.URL.Query().Get("size"); sz != "" {
+		if v, err := strconv.Atoi(sz); err == nil && v > 0 {
+			size = v
+		}
+	}
+
+	tasks, total := s.sm.ListTasksPage(uid, search, page, size)
 	if tasks == nil {
 		tasks = []models.TaskInfo{}
 	}
 	writeJSON(w, 200, map[string]interface{}{
 		"tasks": tasks,
-		"count": len(tasks),
+		"total": total,
 	})
 }
 
@@ -157,6 +169,9 @@ func (s *Server) handleTaskUpdate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		NovelName         string `json:"novel_name"`
 		AccountID         string `json:"account_id"`
+		VolumeName        string `json:"volume_name"`
+		Title             string `json:"title"`
+		ChapterNumber     int    `json:"chapter_number"`
 		ChapterCountDelta int    `json:"chapter_count_delta"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -164,7 +179,7 @@ func (s *Server) handleTaskUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.sm.UpdateTaskFields(taskID, req.NovelName, req.AccountID, req.ChapterCountDelta); err != nil {
+	if err := s.sm.UpdateTaskFields(taskID, req.NovelName, req.AccountID, req.VolumeName, req.Title, req.ChapterNumber, req.ChapterCountDelta); err != nil {
 		writeError(w, 500, "failed to update task: "+err.Error())
 		return
 	}
@@ -232,7 +247,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.NovelName != "" {
-		_ = s.sm.UpdateTaskFields(req.TaskID, req.NovelName, "", 0)
+		_ = s.sm.UpdateTaskFields(req.TaskID, req.NovelName, "", "", "", 0, 0)
 	}
 
 	writeJSON(w, 201, map[string]interface{}{
@@ -350,10 +365,20 @@ func (s *Server) handleGetDraft(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, 200, map[string]string{
-		"session_id": sessionID,
-		"draft":      draft,
-	})
+	chapterTitle := store.ExtractChapterTitle(draft)
+
+	resp := map[string]interface{}{
+		"session_id":    sessionID,
+		"draft":         draft,
+		"chapter_title": chapterTitle,
+	}
+
+	sess, _, err := s.sm.GetSession(sessionID)
+	if err == nil {
+		resp["draft_version"] = sess.DraftVersion
+	}
+
+	writeJSON(w, 200, resp)
 }
 
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {

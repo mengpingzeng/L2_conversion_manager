@@ -22,7 +22,13 @@ func main() {
 	model := flag.String("model", "team-deepseek/deepseek-chat", "Default model")
 	maxConcurrent := flag.Int("max-concurrent", 3, "Max concurrent opencode processes")
 	staleTimeoutMin := flag.Int("stale-timeout-min", 60, "Stale session timeout in minutes")
+	deepseekAPIKey := flag.String("deepseek-api-key", "", "DeepSeek API key (or set DEEPSEEK_API_KEY env)")
 	flag.Parse()
+
+	apiKey := *deepseekAPIKey
+	if apiKey == "" {
+		apiKey = os.Getenv("DEEPSEEK_API_KEY")
+	}
 
 	cfg := manager.Config{
 		DataDir:             *dataDir,
@@ -33,6 +39,7 @@ func main() {
 		MaxMessagesPerEpoch: 40,
 		MaxTokensPerEpoch:   60000,
 		StaleTimeoutMin:     *staleTimeoutMin,
+		DeepseekAPIKey:      apiKey,
 	}
 
 	sm, err := manager.New(cfg)
