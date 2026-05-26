@@ -5,10 +5,12 @@ import "time"
 type SessionStatus string
 
 const (
-	StatusCreated  SessionStatus = "CREATED"
-	StatusWarm     SessionStatus = "WARM"
-	StatusCold     SessionStatus = "COLD"
-	StatusArchived SessionStatus = "ARCHIVED"
+	StatusCreated    SessionStatus = "CREATED"
+	StatusGenerating SessionStatus = "GENERATING"
+	StatusDraftReady SessionStatus = "DRAFT_READY"
+	StatusWarm       SessionStatus = "WARM"
+	StatusCold       SessionStatus = "COLD"
+	StatusArchived   SessionStatus = "ARCHIVED"
 )
 
 const (
@@ -39,22 +41,25 @@ type Task struct {
 }
 
 type Session struct {
-	SessionID    string        `json:"session_id"`
-	TaskID       string        `json:"task_id"`
-	Topic        string        `json:"topic"`
-	SkillID      string        `json:"skill_id"`
-	Model        string        `json:"model"`
-	Status       SessionStatus `json:"status"`
-	OpenCodeSID  string        `json:"opencode_sid,omitempty"`
-	CWDPath      string        `json:"cwd_path"`
-	LatestDraft  string        `json:"latest_draft,omitempty"`
-	MessageCount int           `json:"message_count"`
-	TotalTokens  int           `json:"total_tokens"`
-	DraftVersion int           `json:"draft_version"`
-	CreatedAt    time.Time     `json:"created_at"`
-	LastActiveAt time.Time     `json:"last_active_at"`
-	ArchivedAt   *time.Time    `json:"archived_at,omitempty"`
-	Episodes     []Episode     `json:"episodes,omitempty"`
+	SessionID     string        `json:"session_id"`
+	TaskID        string        `json:"task_id"`
+	Topic         string        `json:"topic"`
+	SkillID       string        `json:"skill_id"`
+	Model         string        `json:"model"`
+	Status        SessionStatus `json:"status"`
+	OpenCodeSID   string        `json:"opencode_sid,omitempty"`
+	CWDPath       string        `json:"cwd_path"`
+	LatestDraft   string        `json:"latest_draft,omitempty"`
+	MessageCount  int           `json:"message_count"`
+	TotalTokens   int           `json:"total_tokens"`
+	DraftVersion  int           `json:"draft_version"`
+	NovelName     string        `json:"novel_name,omitempty"`
+	VolumeName    string        `json:"volume_name,omitempty"`
+	ChapterNumber int           `json:"chapter_number"`
+	CreatedAt     time.Time     `json:"created_at"`
+	LastActiveAt  time.Time     `json:"last_active_at"`
+	ArchivedAt    *time.Time    `json:"archived_at,omitempty"`
+	Episodes      []Episode     `json:"episodes,omitempty"`
 }
 
 type Episode struct {
@@ -69,19 +74,29 @@ type Episode struct {
 }
 
 type SessionEvent struct {
-	Type       string      `json:"type"`
-	SessionID  string      `json:"session_id"`
-	TaskID     string      `json:"task_id,omitempty"`
-	Seq        int         `json:"seq,omitempty"`
-	Text       string      `json:"text,omitempty"`
-	Tool       string      `json:"tool,omitempty"`
-	ToolArgs   interface{} `json:"tool_args,omitempty"`
-	ToolResult string      `json:"tool_result,omitempty"`
-	DraftPath  string      `json:"draft_path,omitempty"`
-	Tokens     *TokenInfo  `json:"tokens,omitempty"`
-	Error      string      `json:"error,omitempty"`
-	Reason     string      `json:"reason,omitempty"`
-	NovelName  string      `json:"novel_name,omitempty"`
+	Type         string      `json:"type"`
+	SessionID    string      `json:"session_id"`
+	TaskID       string      `json:"task_id,omitempty"`
+	Seq          int         `json:"seq,omitempty"`
+	Text         string      `json:"text,omitempty"`
+	Tool         string      `json:"tool,omitempty"`
+	ToolArgs     interface{} `json:"tool_args,omitempty"`
+	ToolResult   string      `json:"tool_result,omitempty"`
+	DraftPath    string      `json:"draft_path,omitempty"`
+	Tokens       *TokenInfo  `json:"tokens,omitempty"`
+	Error        string      `json:"error,omitempty"`
+	Reason       string      `json:"reason,omitempty"`
+	NovelName    string      `json:"novel_name,omitempty"`
+	DraftVersion int         `json:"draft_version,omitempty"`
+}
+
+type ChatMessage struct {
+	ID           string    `json:"id"`
+	TaskID       string    `json:"task_id"`
+	SessionID    string    `json:"session_id,omitempty"`
+	Role         string    `json:"role"`
+	Text         string    `json:"text"`
+	Timestamp    time.Time `json:"timestamp"`
 	DraftVersion int       `json:"draft_version,omitempty"`
 }
 
@@ -113,8 +128,12 @@ type SendMessageRequest struct {
 }
 
 type WakeTaskRequest struct {
-	Text         string `json:"text,omitempty"`
-	DraftVersion int    `json:"draft_version"`
+	Text          string `json:"text,omitempty"`
+	DraftVersion  int    `json:"draft_version"`
+	IsFinale      bool   `json:"is_finale,omitempty"`
+	NovelName     string `json:"novel_name,omitempty"`
+	VolumeName    string `json:"volume_name,omitempty"`
+	ChapterNumber int    `json:"chapter_number,omitempty"`
 }
 
 type SkillInfo struct {
@@ -160,9 +179,9 @@ func (e *TaskBusyError) Error() string {
 }
 
 type MemorySummary struct {
-	Topic    string `json:"topic"`
-	Intent   string `json:"intent"`
-	Summary  string `json:"summary"`
+	Topic        string   `json:"topic"`
+	Intent       string   `json:"intent"`
+	Summary      string   `json:"summary"`
 	KeyDecisions []string `json:"key_decisions"`
-	DraftPreview string `json:"draft_preview"`
+	DraftPreview string   `json:"draft_preview"`
 }

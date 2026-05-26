@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"clawstudios/pkg/logging"
 	"session_manager/api"
 	"session_manager/manager"
 )
@@ -59,7 +60,7 @@ func main() {
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *port),
-		Handler: corsMiddleware(server.Router()),
+		Handler: logging.HTTPMiddleware("SessionManager")(corsMiddleware(server.Router())),
 	}
 
 	go func() {

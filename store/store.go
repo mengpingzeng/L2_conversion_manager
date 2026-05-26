@@ -78,14 +78,23 @@ func (s *Store) saveTasks() error {
 	return os.Rename(tmpPath, s.tasksPath)
 }
 
-func (s *Store) DataDir() string                           { return s.dataDir }
-func (s *Store) SkillsDir() string                          { return s.skillsDir }
-func (s *Store) SkillDir(skillName string) string           { return filepath.Join(s.skillsDir, skillName) }
-func (s *Store) TasksDir() string                           { return filepath.Join(s.dataDir, "tasks") }
-func (s *Store) TaskDir(taskID string) string               { return filepath.Join(s.dataDir, "tasks", taskID) }
-func (s *Store) TaskSessionsDir(taskID string) string       { return filepath.Join(s.dataDir, "tasks", taskID, "sessions") }
-func (s *Store) TaskMemoryDir(taskID string) string         { return filepath.Join(s.dataDir, "tasks", taskID, "memory") }
-func (s *Store) TaskSessionsFile(taskID string) string      { return filepath.Join(s.dataDir, "tasks", taskID, "sessions.json") }
+func (s *Store) DataDir() string                  { return s.dataDir }
+func (s *Store) SkillsDir() string                { return s.skillsDir }
+func (s *Store) SkillDir(skillName string) string { return filepath.Join(s.skillsDir, skillName) }
+func (s *Store) TasksDir() string                 { return filepath.Join(s.dataDir, "tasks") }
+func (s *Store) TaskDir(taskID string) string     { return filepath.Join(s.dataDir, "tasks", taskID) }
+func (s *Store) TaskSessionsDir(taskID string) string {
+	return filepath.Join(s.dataDir, "tasks", taskID, "sessions")
+}
+func (s *Store) TaskMemoryDir(taskID string) string {
+	return filepath.Join(s.dataDir, "tasks", taskID, "memory")
+}
+func (s *Store) TaskSessionsFile(taskID string) string {
+	return filepath.Join(s.dataDir, "tasks", taskID, "sessions.json")
+}
+func (s *Store) TaskMessagesFile(taskID string) string {
+	return filepath.Join(s.dataDir, "tasks", taskID, "messages.jsonl")
+}
 func (s *Store) TaskDraftPath(taskID string, version int) string {
 	return filepath.Join(s.dataDir, "tasks", taskID, fmt.Sprintf("draft_v%d.md", version))
 }
@@ -146,6 +155,22 @@ func (s *Store) TrySetActiveSession(taskID, sessionID string) (bool, string, err
 		return false, "", err
 	}
 	return true, "", nil
+}
+
+func (s *Store) ClearActiveSession(taskID, sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	t, ok := s.tasks[taskID]
+	if !ok {
+		return fmt.Errorf("task not found: %s", taskID)
+	}
+	if t.ActiveSessionID == sessionID {
+		t.ActiveSessionID = ""
+		t.LastActiveAt = time.Now()
+		return s.saveTasks()
+	}
+	return nil
 }
 
 func (s *Store) GetOrCreateTask(taskID, topic, uid, memoryModel, platform, skillID, model, accountID string) (*models.Task, bool, error) {
@@ -298,6 +323,51 @@ func (s *Store) SaveTaskSessions(taskID string, sessions []*models.Session) erro
 		return err
 	}
 	return os.Rename(tmpPath, path)
+}
+
+func (s *Store) AppendTaskMessage(taskID string, msg models.ChatMessage) error {
+	if err := s.EnsureTaskDir(taskID); err != nil {
+		return err
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	path := s.TaskMessagesFile(taskID)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) LoadTaskMessages(taskID string) ([]models.ChatMessage, error) {
+	path := s.TaskMessagesFile(taskID)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []models.ChatMessage{}, nil
+		}
+		return nil, err
+	}
+	lines := strings.Split(string(data), "\n")
+	messages := make([]models.ChatMessage, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var msg models.ChatMessage
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			return nil, err
+		}
+		messages = append(messages, msg)
+	}
+	return messages, nil
 }
 
 func (s *Store) UpsertSessionInTask(sess *models.Session) error {

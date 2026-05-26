@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"clawstudios/pkg/logging"
 	"session_manager/models"
 )
 
@@ -68,6 +69,13 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 		defer close(events)
 		defer w.close()
 
+		logger := logging.FromContext(ctx)
+		if logger == nil {
+			logger = logging.NewLogger("OpenCodeRunner")
+		}
+
+		startTime := time.Now()
+
 		var textBuf strings.Builder
 		hasWrite := false
 
@@ -108,12 +116,15 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 		}
 
 		if err := cmd.Start(); err != nil {
+			logger.Error(logging.ErrSessionError, "opencode start failed: cwd=%s model=%s err=%v", opts.CWD, opts.Model, err)
 			w.send(models.SessionEvent{
 				Type:  "error",
 				Error: fmt.Sprintf("failed to start opencode: %v", err),
 			})
 			return
 		}
+
+		logger.Info("opencode process started: pid=%d cwd=%s model=%s", cmd.Process.Pid, opts.CWD, opts.Model)
 
 		go func() {
 			sc := bufio.NewScanner(stderr)
@@ -163,9 +174,11 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 			log.Printf("[opencode stdout] scanner error (SID=%s): %v", capturedSID, err)
 		}
 
-		if err := cmd.Wait(); err != nil {
-			if ctx.Err() != nil {
-				w.send(models.SessionEvent{
+	if err := cmd.Wait(); err != nil {
+		duration := time.Since(startTime)
+		if ctx.Err() != nil {
+			logger.Warn(logging.WarnSlowResponse, "opencode timeout/cancelled: pid=%d duration=%s", cmd.Process.Pid, duration)
+			w.send(models.SessionEvent{
 					Type:      "error",
 					SessionID: capturedSID,
 					Error:     "process timeout or cancelled",
@@ -176,10 +189,14 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 					SessionID: capturedSID,
 					Error:     fmt.Sprintf("opencode exited: %v", err),
 				})
-			}
 		}
+	}
 
-		if !hasWrite && textBuf.Len() > 0 {
+	duration := time.Since(startTime)
+	logger.Info("opencode process exited: pid=%d duration=%s lines=%d has_write=%v",
+		cmd.Process.Pid, duration, seq, hasWrite)
+
+	if !hasWrite && textBuf.Len() > 0 {
 			draftPath := filepath.Join(opts.CWD, "current_draft.md")
 			if err := os.WriteFile(draftPath, []byte(textBuf.String()), 0644); err == nil {
 				w.send(models.SessionEvent{

@@ -356,6 +356,81 @@ func BuildWakeMessage(topic string, skill SkillDef, userText string, hasShortTer
 	return sb.String()
 }
 
+func BuildFinaleMessage(topic string, skill SkillDef, userText string, hasShortTerm, hasMediumTerm bool, chapterNumber int) string {
+	var sb strings.Builder
+
+	sb.WriteString("# ⚠️ 续写任务(大结局) — 创作最终章\n\n")
+	sb.WriteString("这是对已有小说的最终章续写操作。你需要为整个故事画上圆满的句号。\n\n")
+	sb.WriteString("## 红线禁令（违反将导致内容作废）\n\n")
+	sb.WriteString("1. **禁止创建全新故事**：不得另起炉灶，不得更换世界观或故事背景\n")
+	sb.WriteString("2. **禁止更换主角**：已有主角的姓名、身份、性格必须与前文完全一致\n")
+	sb.WriteString(fmt.Sprintf("3. **本次章节编号**：第 %d 章（这是小说的大结局/最终章，不得使用其他编号）\n", chapterNumber))
+	sb.WriteString("4. **禁止忽略前文**：必须先使用 read 工具完整阅读 RECENT_DRAFTS.md\n\n")
+	sb.WriteString(fmt.Sprintf("你正在为任务「%s」创作大结局章节。\n\n", topic))
+
+	if hasShortTerm && hasMediumTerm {
+		sb.WriteString("## 历史上下文\n\n")
+		sb.WriteString("工作目录下有两个历史上下文文件，请仔细阅读后基于它们创作结局：\n\n")
+		sb.WriteString("- **RECENT_DRAFTS.md**：近期稿子的完整内容（短期记忆）\n")
+		sb.WriteString("- **HISTORY_SUMMARY.md**：历史摘要（中期记忆）\n\n")
+	} else if hasShortTerm {
+		sb.WriteString("## 历史上下文\n\n")
+		sb.WriteString("工作目录下有近期稿子文件 **RECENT_DRAFTS.md**，请仔细阅读后基于它创作结局。\n\n")
+	} else if hasMediumTerm {
+		sb.WriteString("## 历史上下文\n\n")
+		sb.WriteString("工作目录下有历史摘要文件 **HISTORY_SUMMARY.md**，请仔细阅读后基于它创作结局。\n\n")
+	}
+
+	sb.WriteString("## 大结局创作要点（最高优先级）\n\n")
+	sb.WriteString("本章是整部小说的最终章。请在创作时严格遵循以下原则：\n\n")
+	sb.WriteString("1. **回顾并收束所有伏笔**：仔细回顾前文已铺设的所有伏笔和未解决的冲突，在本章中逐一回收和解决\n")
+	sb.WriteString("2. **完成所有主要角色的命运交代**：每个主要角色都应有明确的结局——或成功、或失败、或继续前行\n")
+	sb.WriteString("3. **剧情闭环**：主线剧情必须走向完结，遗留的问题应在本次得到最终答案\n")
+	sb.WriteString("4. **情感收尾**：结局应给读者完整的情感体验，无论是圆满、遗憾还是开放式的告别\n")
+	sb.WriteString("5. **禁止设置新悬念或伏笔**：作为最终章，不允许留下未解决的线索或「敬请期待下一部」式的开放悬念\n")
+	sb.WriteString("6. **章节标题应体现结局感**：标题可使用「终章」「大结局」「尘埃落定」「新的开始」等传达收束感的词语\n\n")
+
+	if skill.ID == "general_fallback_v1" {
+		sb.WriteString("## 续写操作步骤（必须严格执行）\n\n")
+		sb.WriteString("1. **第一步：全面回顾**。使用 read 工具完整阅读 RECENT_DRAFTS.md，梳理所有人物、伏笔和剧情线\n")
+		sb.WriteString("2. **第二步：提取关键信息**——\n")
+		sb.WriteString("   - 所有已出现人物的姓名、身份、性格和人物关系\n")
+		sb.WriteString("   - 所有未解决的冲突和未回收的伏笔\n")
+		sb.WriteString("   - 前文的写作风格、用词习惯、叙事节奏\n")
+		sb.WriteString(fmt.Sprintf("3. **第三步：创作第 %d 章（大结局）**。先列出需要收束的线索，再开始写作\n", chapterNumber))
+		sb.WriteString("4. **第四步：检查完整性**。确认所有主要角色有结局、所有伏笔已回收、故事已达到自然终结点\n")
+		sb.WriteString("5. 章节标题写在 current_draft.md 最开头，标题后紧跟正文\n")
+		sb.WriteString("6. 人物名称、性格、关系必须与 RECENT_DRAFTS.md 完全一致\n\n")
+	}
+
+	if userText != "" {
+		sb.WriteString("## 用户补充指令\n\n")
+		sb.WriteString(fmt.Sprintf("%s\n\n", userText))
+	}
+
+	sb.WriteString("## 风格要求\n\n")
+	for i, rule := range skill.StyleRules {
+		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, rule))
+	}
+	sb.WriteString("\n")
+
+	sb.WriteString("## 输出约束\n\n")
+	for i, c := range skill.Constraints {
+		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, c))
+	}
+	sb.WriteString("\n")
+
+	sb.WriteString("## 硬性约束（最重要！）\n\n")
+	sb.WriteString("1. 回复完成后，你必须使用 write 工具将完整内容写入 current_draft.md 文件。\n")
+	sb.WriteString("2. 文件路径使用绝对路径或相对于工作目录的路径 current_draft.md\n\n")
+
+	sb.WriteString("## 输出格式\n\n")
+	sb.WriteString("请先直接输出文案正文，然后再使用 write 工具保存到 current_draft.md。\n\n")
+	sb.WriteString("现在请开始创作最终章：")
+
+	return sb.String()
+}
+
 const summaryPromptFormat = `你是一个内容摘要助手。请分析以下稿子内容，按固定 JSON 格式生成摘要。
 
 稿子内容：

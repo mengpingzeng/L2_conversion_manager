@@ -17,6 +17,8 @@ import (
 	"session_manager/runner"
 	"session_manager/store"
 
+	"clawstudios/pkg/logging"
+
 	"github.com/google/uuid"
 )
 
@@ -53,8 +55,9 @@ type SessionManager struct {
 	runner     *runner.OpenCodeRunner
 	skills     map[string]adapter.SkillDef
 
-	mu          sync.RWMutex
-	subscribers map[string][]chan models.SessionEvent
+	mu              sync.RWMutex
+	subscribers     map[string][]chan models.SessionEvent
+	taskSubscribers map[string][]chan models.SessionEvent
 
 	stopCh chan struct{}
 }
@@ -90,13 +93,14 @@ func New(cfg Config) (*SessionManager, error) {
 	}
 
 	sm := &SessionManager{
-		cfg:         cfg,
-		store:       s,
-		pool:        p,
-		runner:      ocRunner,
-		skills:      skills,
-		subscribers: make(map[string][]chan models.SessionEvent),
-		stopCh:      make(chan struct{}),
+		cfg:             cfg,
+		store:           s,
+		pool:            p,
+		runner:          ocRunner,
+		skills:          skills,
+		subscribers:     make(map[string][]chan models.SessionEvent),
+		taskSubscribers: make(map[string][]chan models.SessionEvent),
+		stopCh:          make(chan struct{}),
 	}
 
 	if err := sm.initOpenCodeConfig(); err != nil {
@@ -276,18 +280,21 @@ func (sm *SessionManager) Create(ctx context.Context, req models.CreateSessionRe
 	}
 
 	sess := &models.Session{
-		SessionID:    sessionID,
-		TaskID:       req.TaskID,
-		Topic:        req.Topic,
-		SkillID:      req.SkillID,
-		Model:        model,
-		Status:       models.StatusCreated,
-		CWDPath:      cwd,
-		MessageCount: 0,
-		TotalTokens:  0,
-		DraftVersion: req.DraftVersion,
-		CreatedAt:    now,
-		LastActiveAt: now,
+		SessionID:     sessionID,
+		TaskID:        req.TaskID,
+		Topic:         req.Topic,
+		SkillID:       req.SkillID,
+		Model:         model,
+		Status:        models.StatusCreated,
+		CWDPath:       cwd,
+		MessageCount:  0,
+		TotalTokens:   0,
+		DraftVersion:  req.DraftVersion,
+		NovelName:     req.NovelName,
+		VolumeName:    task.VolumeName,
+		ChapterNumber: task.ChapterNumber,
+		CreatedAt:     now,
+		LastActiveAt:  now,
 	}
 
 	if err := sm.store.UpsertSessionInTask(sess); err != nil {
@@ -308,35 +315,14 @@ func (sm *SessionManager) Create(ctx context.Context, req models.CreateSessionRe
 	}
 	_ = sm.store.UpdateTask(task)
 
-	hasShort, hasMed := sm.store.HasTaskContext(req.TaskID)
 	if !isNew {
 		sm.injectTaskContext(cwd, req.TaskID)
-		if !hasShort {
-			if _, err := os.Stat(filepath.Join(cwd, "RECENT_DRAFTS.md")); err == nil {
-				hasShort = true
-			}
-		}
-		if !hasMed {
-			if _, err := os.Stat(filepath.Join(cwd, "HISTORY_SUMMARY.md")); err == nil {
-				hasMed = true
-			}
-		}
 	}
 
-	msg := req.InitialMsg
-	if msg == "" {
-		if !isNew {
-			chapterNum := req.ChapterNumber
-			if chapterNum <= 0 {
-				chapterNum = task.SessionCount + 1
-			}
-			msg = adapter.BuildWakeMessage(req.Topic, skill, "", hasShort, hasMed, chapterNum)
-		} else {
-			msg = adapter.BuildInitialMessage(req.Topic, skill)
-		}
+	if l := logging.FromContext(ctx); l != nil {
+		l.Info("session created: task=%s session=%s skill=%s model=%s chapter=%d",
+			req.TaskID, sessionID, req.SkillID, model, task.ChapterNumber)
 	}
-
-	go sm.runSessionLoop(context.Background(), sessionID, req.TaskID, cwd, model, msg, "")
 
 	return sess, nil
 }
@@ -348,24 +334,33 @@ func (sm *SessionManager) injectTaskContext(cwd, taskID string) {
 	if errShort != nil || len(shortData) == 0 {
 		sessions, err := sm.store.LoadTaskSessions(taskID)
 		if err == nil && len(sessions) > 0 {
-			var content string
-			start := 0
-			if len(sessions) > models.ShortTermWindowSize {
-				start = len(sessions) - models.ShortTermWindowSize
-			}
-			for i := start; i < len(sessions); i++ {
-				sess := sessions[i]
-				sessCwd := sm.store.GetSessionCWDDir(taskID, sess.SessionID)
-				draftPath := filepath.Join(sessCwd, "current_draft.md")
-				if data, err := os.ReadFile(draftPath); err == nil && len(data) > 0 {
-					content += fmt.Sprintf("## 章节 %d\n\n", i+1)
-					content += string(data)
-					content += "\n\n"
+			var validSessions []*models.Session
+			for _, s := range sessions {
+				if s.Status != models.StatusCreated && s.Status != models.StatusGenerating {
+					validSessions = append(validSessions, s)
 				}
 			}
-			if len(content) > 0 {
-				shortData = []byte(content)
-				errShort = nil
+			if len(validSessions) > 0 {
+				var content string
+				start := 0
+				if len(validSessions) > models.ShortTermWindowSize {
+					start = len(validSessions) - models.ShortTermWindowSize
+				}
+				for i := start; i < len(validSessions); i++ {
+					sess := validSessions[i]
+					sessCwd := sm.store.GetSessionCWDDir(taskID, sess.SessionID)
+					draftPath := filepath.Join(sessCwd, "current_draft.md")
+					if data, err := os.ReadFile(draftPath); err == nil && len(data) > 0 {
+						chapterNo := sm.inferChapterNumberForSession(taskID, sess)
+						content += fmt.Sprintf("## 章节 %d\n\n", chapterNo)
+						content += string(data)
+						content += "\n\n"
+					}
+				}
+				if len(content) > 0 {
+					shortData = []byte(content)
+					errShort = nil
+				}
 			}
 		}
 	}
@@ -385,14 +380,27 @@ func (sm *SessionManager) injectTaskContext(cwd, taskID string) {
 	}
 }
 
+func (sm *SessionManager) inferChapterNumberForSession(taskID string, sess *models.Session) int {
+	sessions, err := sm.store.LoadTaskSessions(taskID)
+	if err != nil {
+		return 1
+	}
+	chapNo := 1
+	for _, s := range sessions {
+		if s.SessionID == sess.SessionID {
+			return chapNo
+		}
+		if s.Status != models.StatusCreated && s.Status != models.StatusGenerating {
+			chapNo++
+		}
+	}
+	return chapNo
+}
+
 func (sm *SessionManager) Send(ctx context.Context, sessionID string, req models.SendMessageRequest) error {
 	sess, taskID, err := sm.findSession(sessionID)
 	if err != nil {
 		return err
-	}
-
-	if sess.Status == models.StatusArchived {
-		return fmt.Errorf("session is archived: %s", sessionID)
 	}
 
 	if sess.Status == models.StatusCold {
@@ -401,7 +409,12 @@ func (sm *SessionManager) Send(ctx context.Context, sessionID string, req models
 
 	sess.LastActiveAt = time.Now()
 	sess.DraftVersion = req.DraftVersion
+	if sess.Status == models.StatusArchived {
+		sess.Status = models.StatusWarm
+		sess.ArchivedAt = nil
+	}
 	_ = sm.store.UpsertSessionInTask(sess)
+	sm.appendTaskMessage(taskID, sessionID, "user", req.Text, req.DraftVersion)
 
 	task, err := sm.store.GetTask(taskID)
 	if err == nil {
@@ -415,8 +428,14 @@ func (sm *SessionManager) Send(ctx context.Context, sessionID string, req models
 }
 
 func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID, cwd, model, message, ocSID string) {
+	logger := logging.NewLogger("SessionWorker",
+		logging.WithTaskID(taskID),
+		logging.WithSessionID(sessionID),
+	)
+
 	if err := sm.pool.Acquire(ctx); err != nil {
-		log.Printf("pool acquire failed for %s: %v", sessionID, err)
+		logger.Error(logging.ErrTimeout, "pool acquire failed: session=%s err=%v", sessionID, err)
+		sm.appendTaskMessage(taskID, sessionID, "system", "server busy, please retry later", 0)
 		sm.broadcast(sessionID, models.SessionEvent{
 			Type:      "error",
 			SessionID: sessionID,
@@ -426,6 +445,16 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 		return
 	}
 	defer sm.pool.Release()
+
+	logger.Info("pool acquired, session loop start: session=%s task=%s model=%s", sessionID, taskID, model)
+
+	sess, err := sm.store.GetSession(taskID, sessionID)
+	if err == nil && sess.Status == models.StatusCreated {
+		sess.Status = models.StatusGenerating
+		sess.LastActiveAt = time.Now()
+		_ = sm.store.UpsertSessionInTask(sess)
+		logger.Info("status changed: CREATED -> GENERATING: session=%s", sessionID)
+	}
 
 	timeout := time.Duration(sm.cfg.DefaultTimeoutSec) * time.Second
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -441,13 +470,17 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 		DeepseekAPIKey: sm.cfg.DeepseekAPIKey,
 	}
 
+	logger.Info("launching opencode: session=%s model=%s cwd=%s", sessionID, model, cwd)
 	events, err := sm.runner.Run(runCtx, opts)
 	if err != nil {
+		logger.Error(logging.ErrSessionError, "opencode launch failed: session=%s err=%v", sessionID, err)
+		errText := fmt.Sprintf("failed to start opencode: %v", err)
+		sm.appendTaskMessage(taskID, sessionID, "system", errText, 0)
 		sm.broadcast(sessionID, models.SessionEvent{
 			Type:      "error",
 			SessionID: sessionID,
 			TaskID:    taskID,
-			Error:     fmt.Sprintf("failed to start opencode: %v", err),
+			Error:     errText,
 		})
 		return
 	}
@@ -456,6 +489,7 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 	totalTokens := 0
 	capturedSID := ocSID
 	var textBuf strings.Builder
+	var assistantText strings.Builder
 
 	for evt := range events {
 		if capturedSID == "" && evt.SessionID != "" && evt.SessionID != sessionID {
@@ -467,6 +501,7 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 
 		if evt.Type == "token" {
 			textBuf.WriteString(evt.Text)
+			assistantText.WriteString(evt.Text)
 		}
 
 		if evt.Type == "step_start" && capturedSID != "" {
@@ -494,7 +529,6 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 			cwd := sm.store.GetSessionCWDDir(taskID, sessionID)
 			draftPath := filepath.Join(cwd, "current_draft.md")
 			newContent := []byte(textBuf.String())
-			// 不覆盖更长的已有内容（AI 可能在后续回复中输出短确认消息，覆盖掉已写好的章节正文）
 			write := true
 			if existing, err := os.ReadFile(draftPath); err == nil && len(existing) > len(newContent) {
 				write = false
@@ -507,12 +541,20 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 						TaskID:    taskID,
 						DraftPath: draftPath,
 					})
+					if draftSess, getErr := sm.store.GetSession(taskID, sessionID); getErr == nil && draftSess.Status == models.StatusGenerating {
+						draftSess.Status = models.StatusDraftReady
+						_ = sm.store.UpsertSessionInTask(draftSess)
+						logger.Info("status changed: GENERATING -> DRAFT_READY: session=%s draft=%d bytes", sessionID, len(newContent))
+					}
 				}
 			}
 		}
 
 		if evt.Type == "token" || evt.Type == "tool_call" || evt.Type == "step_finish" ||
 			evt.Type == "done" || evt.Type == "error" || evt.Type == "draft_updated" {
+			if evt.Type == "error" && evt.Error != "" {
+				sm.appendTaskMessage(taskID, sessionID, "system", evt.Error, 0)
+			}
 			sm.broadcast(sessionID, evt)
 		}
 	}
@@ -522,16 +564,16 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 	if data, err := os.ReadFile(chkPath); err == nil && len(data) > 0 {
 		firstLine := strings.TrimSpace(strings.SplitN(string(data), "\n", 2)[0])
 		if !strings.HasPrefix(firstLine, "# 第") || !strings.Contains(firstLine, "章") {
-			chapterNo := sm.inferChapterNumber(taskID)
+			chapterNo := sm.inferChapterNumberForSession(taskID, sess)
 			newContent := fmt.Sprintf("# 第%d章\n\n%s", chapterNo, string(data))
 			if err := os.WriteFile(chkPath, []byte(newContent), 0644); err == nil {
-				log.Printf("[chapter-title] auto-fixed session=%s chapter=%d", sessionID, chapterNo)
+				logger.Info("chapter title auto-fixed: session=%s chapter=%d", sessionID, chapterNo)
 			}
 		}
 	}
 
 	msgCount++
-	sess, err := sm.store.GetSession(taskID, sessionID)
+	sess, err = sm.store.GetSession(taskID, sessionID)
 	if err == nil {
 		fresh, freshErr := sm.store.GetSession(taskID, sessionID)
 		if freshErr == nil {
@@ -547,6 +589,8 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 			sess.TotalTokens += totalTokens
 			sess.LastActiveAt = time.Now()
 			sess.Status = models.StatusWarm
+			logger.Info("status changed: -> WARM: session=%s msg_count=%d total_tokens=%d draft_version=%d",
+				sessionID, sess.MessageCount, sess.TotalTokens, sess.DraftVersion)
 		}
 		if capturedSID != "" && sess.OpenCodeSID == "" {
 			sess.OpenCodeSID = capturedSID
@@ -558,7 +602,7 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 		}
 
 		if sess.MessageCount >= sm.cfg.MaxMessagesPerEpoch || sess.TotalTokens >= sm.cfg.MaxTokensPerEpoch {
-			log.Printf("session %s reached archive threshold: msgs=%d tokens=%d, auto-archiving",
+			logger.Info("archive threshold reached: session=%s msgs=%d tokens=%d, auto-archiving",
 				sessionID, sess.MessageCount, sess.TotalTokens)
 			sm.Close(context.Background(), sessionID)
 		}
@@ -569,6 +613,18 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 		task.LastActiveAt = time.Now()
 		_ = sm.store.UpdateTask(task)
 	}
+	_ = sm.store.ClearActiveSession(taskID, sessionID)
+
+	if strings.TrimSpace(assistantText.String()) != "" {
+		version := 0
+		if sess != nil {
+			version = sess.DraftVersion
+		}
+		sm.appendTaskMessage(taskID, sessionID, "assistant", assistantText.String(), version)
+	}
+
+	logger.Info("session loop done: session=%s opencode_sid=%s", sessionID, capturedSID)
+	logger.Close()
 }
 
 func (sm *SessionManager) saveDraftVersion(taskID, sessionID string, version int) {
@@ -656,6 +712,11 @@ func (sm *SessionManager) Close(ctx context.Context, sessionID string) error {
 
 	if len(draftData) > 0 {
 		go sm.generateMediumSummary(taskID, sessionID, task, sess.SkillID, draftData)
+	}
+
+	if l := logging.FromContext(ctx); l != nil {
+		l.Info("session archived: session=%s task=%s epoch=%d msgs=%d tokens=%d",
+			sessionID, taskID, epochNo, sess.MessageCount, sess.TotalTokens)
 	}
 
 	return nil
@@ -791,24 +852,42 @@ func (sm *SessionManager) WakeTask(ctx context.Context, taskID string, req model
 
 	model := sm.cfg.DefaultModel
 
+	novelName := req.NovelName
+	if novelName == "" {
+		novelName = task.NovelName
+	}
+	volumeName := req.VolumeName
+	if volumeName == "" {
+		volumeName = task.VolumeName
+	}
+	chapterNumber := req.ChapterNumber
+	if chapterNumber <= 0 {
+		chapterNumber = task.ChapterNumber
+	}
+
 	sess := &models.Session{
-		SessionID:    sessionID,
-		TaskID:       taskID,
-		Topic:        task.Topic,
-		SkillID:      skillID,
-		Model:        model,
-		Status:       models.StatusCreated,
-		CWDPath:      cwd,
-		MessageCount: 0,
-		TotalTokens:  0,
-		DraftVersion: req.DraftVersion,
-		CreatedAt:    now,
-		LastActiveAt: now,
+		SessionID:     sessionID,
+		TaskID:        taskID,
+		Topic:         task.Topic,
+		SkillID:       skillID,
+		Model:         model,
+		Status:        models.StatusCreated,
+		CWDPath:       cwd,
+		MessageCount:  0,
+		TotalTokens:   0,
+		DraftVersion:  req.DraftVersion,
+		NovelName:     novelName,
+		VolumeName:    volumeName,
+		ChapterNumber: chapterNumber,
+		CreatedAt:     now,
+		LastActiveAt:  now,
 	}
 
 	if err := sm.store.UpsertSessionInTask(sess); err != nil {
 		return nil, fmt.Errorf("save session: %w", err)
 	}
+
+	log.Printf("[wake] task=%s session=%s vol=%s ch=%d novel=%s", taskID, sessionID, volumeName, chapterNumber, novelName)
 
 	task, _ = sm.store.GetTask(taskID)
 	task.LastActiveAt = now
@@ -828,7 +907,14 @@ func (sm *SessionManager) WakeTask(ctx context.Context, taskID string, req model
 		}
 	}
 
-	msg := adapter.BuildWakeMessage(task.Topic, skill, req.Text, hasShort, hasMed, task.SessionCount+1)
+	chapterNum := task.SessionCount + 1
+
+	var msg string
+	if req.IsFinale {
+		msg = adapter.BuildFinaleMessage(task.Topic, skill, req.Text, hasShort, hasMed, chapterNum)
+	} else {
+		msg = adapter.BuildWakeMessage(task.Topic, skill, req.Text, hasShort, hasMed, chapterNum)
+	}
 
 	go sm.runSessionLoop(context.Background(), sessionID, taskID, cwd, model, msg, "")
 
@@ -923,6 +1009,9 @@ func (sm *SessionManager) GetTask(taskID string) (*models.TaskInfo, error) {
 		NovelName:             task.NovelName,
 		AccountID:             task.AccountID,
 		PublishedChapterCount: task.PublishedChapterCount,
+		VolumeName:            task.VolumeName,
+		Title:                 task.Title,
+		ChapterNumber:         task.ChapterNumber,
 	}, nil
 }
 
@@ -954,6 +1043,14 @@ func (sm *SessionManager) Subscribe(sessionID string) chan models.SessionEvent {
 	return ch
 }
 
+func (sm *SessionManager) SubscribeTask(taskID string) chan models.SessionEvent {
+	ch := make(chan models.SessionEvent, 100)
+	sm.mu.Lock()
+	sm.taskSubscribers[taskID] = append(sm.taskSubscribers[taskID], ch)
+	sm.mu.Unlock()
+	return ch
+}
+
 func (sm *SessionManager) Unsubscribe(sessionID string, ch chan models.SessionEvent) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -961,6 +1058,19 @@ func (sm *SessionManager) Unsubscribe(sessionID string, ch chan models.SessionEv
 	for i, sub := range subs {
 		if sub == ch {
 			sm.subscribers[sessionID] = append(subs[:i], subs[i+1:]...)
+			close(ch)
+			return
+		}
+	}
+}
+
+func (sm *SessionManager) UnsubscribeTask(taskID string, ch chan models.SessionEvent) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	subs := sm.taskSubscribers[taskID]
+	for i, sub := range subs {
+		if sub == ch {
+			sm.taskSubscribers[taskID] = append(subs[:i], subs[i+1:]...)
 			close(ch)
 			return
 		}
@@ -978,8 +1088,36 @@ func (sm *SessionManager) broadcast(sessionID string, evt models.SessionEvent) {
 			dropped++
 		}
 	}
+	if evt.TaskID != "" {
+		for _, ch := range sm.taskSubscribers[evt.TaskID] {
+			select {
+			case ch <- evt:
+			default:
+				dropped++
+			}
+		}
+	}
 	if dropped > 0 {
 		log.Printf("[broadcast] session=%s type=%s 丢弃事件 %d 条（订阅者通道已满）", sessionID, evt.Type, dropped)
+	}
+}
+
+func (sm *SessionManager) ListTaskMessages(taskID string) ([]models.ChatMessage, error) {
+	return sm.store.LoadTaskMessages(taskID)
+}
+
+func (sm *SessionManager) appendTaskMessage(taskID, sessionID, role, text string, draftVersion int) {
+	msg := models.ChatMessage{
+		ID:           uuid.New().String(),
+		TaskID:       taskID,
+		SessionID:    sessionID,
+		Role:         role,
+		Text:         text,
+		Timestamp:    time.Now(),
+		DraftVersion: draftVersion,
+	}
+	if err := sm.store.AppendTaskMessage(taskID, msg); err != nil {
+		log.Printf("WARN: failed to append task message task=%s session=%s role=%s: %v", taskID, sessionID, role, err)
 	}
 }
 
