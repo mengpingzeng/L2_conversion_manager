@@ -173,7 +173,7 @@ func (s *Store) ClearActiveSession(taskID, sessionID string) error {
 	return nil
 }
 
-func (s *Store) GetOrCreateTask(taskID, topic, uid, memoryModel, platform, skillID, model, accountID string) (*models.Task, bool, error) {
+func (s *Store) GetOrCreateTask(taskID, topic, uid, memoryModel, platform, skillID, model, accountID, novelName string) (*models.Task, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -199,6 +199,7 @@ func (s *Store) GetOrCreateTask(taskID, topic, uid, memoryModel, platform, skill
 		Model:       model,
 		MemoryModel: memoryModel,
 		AccountID:   accountID,
+		NovelName:   novelName,
 		CreatedAt:   time.Now(),
 		SessionIDs:  []string{},
 	}
@@ -239,6 +240,22 @@ func (s *Store) ListTasks() []*models.Task {
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].CreatedAt.After(result[j].CreatedAt)
 	})
+	return result
+}
+
+func (s *Store) ListTaskSkillIDs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	seen := map[string]bool{}
+	for _, t := range s.tasks {
+		if t.SkillID != "" {
+			seen[t.SkillID] = true
+		}
+	}
+	result := make([]string, 0, len(seen))
+	for id := range seen {
+		result = append(result, id)
+	}
 	return result
 }
 
@@ -370,6 +387,17 @@ func (s *Store) LoadTaskMessages(taskID string) ([]models.ChatMessage, error) {
 	return messages, nil
 }
 
+func (s *Store) ClearTaskMessages(taskID string) error {
+	if err := s.EnsureTaskDir(taskID); err != nil {
+		return err
+	}
+	path := s.TaskMessagesFile(taskID)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 func (s *Store) UpsertSessionInTask(sess *models.Session) error {
 	path := s.TaskSessionsFile(sess.TaskID)
 	var sessions []*models.Session
@@ -484,6 +512,9 @@ func (s *Store) UpdateShortTerm(taskID string, sessions []*models.Session) error
 	var content string
 	for i := start; i < len(sessions); i++ {
 		sess := sessions[i]
+		if sess.ChapterNumber <= 0 {
+			continue
+		}
 		cwd := s.GetSessionCWDDir(taskID, sess.SessionID)
 		draftPath := filepath.Join(cwd, "current_draft.md")
 		if data, err := os.ReadFile(draftPath); err == nil {
@@ -527,13 +558,16 @@ func (s *Store) EnsureTaskDirExists(taskID string) error {
 var chapterPrefixRe = regexp.MustCompile(`^第[^\s章]+章\s*`)
 
 func ExtractChapterTitle(draft string) string {
-	lines := strings.SplitN(draft, "\n", 5)
+	lines := strings.SplitN(draft, "\n", 20)
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "# ") {
 			title := strings.TrimPrefix(trimmed, "# ")
 			title = chapterPrefixRe.ReplaceAllString(title, "")
-			return title
+			title = strings.TrimSpace(title)
+			if title != "" {
+				return title
+			}
 		}
 	}
 	return ""

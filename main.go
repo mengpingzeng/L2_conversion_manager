@@ -23,13 +23,9 @@ func main() {
 	model := flag.String("model", "team-deepseek/deepseek-chat", "Default model")
 	maxConcurrent := flag.Int("max-concurrent", 3, "Max concurrent opencode processes")
 	staleTimeoutMin := flag.Int("stale-timeout-min", 60, "Stale session timeout in minutes")
-	deepseekAPIKey := flag.String("deepseek-api-key", "", "DeepSeek API key (or set DEEPSEEK_API_KEY env)")
+	deepseekAPIKey := flag.String("deepseek-api-key", "", "Optional override for DeepSeek API key (default: read from OPENCODE_CONFIG provider section)")
+	skillRegistry := flag.String("skill-registry", "http://localhost:18090", "Skill Registry URL")
 	flag.Parse()
-
-	apiKey := *deepseekAPIKey
-	if apiKey == "" {
-		apiKey = os.Getenv("DEEPSEEK_API_KEY")
-	}
 
 	cfg := manager.Config{
 		DataDir:             *dataDir,
@@ -40,7 +36,8 @@ func main() {
 		MaxMessagesPerEpoch: 40,
 		MaxTokensPerEpoch:   60000,
 		StaleTimeoutMin:     *staleTimeoutMin,
-		DeepseekAPIKey:      apiKey,
+		DeepseekAPIKey:      *deepseekAPIKey,
+		SkillRegistryURL:    *skillRegistry,
 	}
 
 	sm, err := manager.New(cfg)

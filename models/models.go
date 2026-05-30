@@ -127,10 +127,19 @@ type SendMessageRequest struct {
 	DraftVersion int    `json:"draft_version"`
 }
 
+type TaskMessageRequest struct {
+	Text            string `json:"text"`
+	TargetSessionID string `json:"target_session_id,omitempty"`
+	DraftVersion    int    `json:"draft_version"`
+	Mode            string `json:"mode,omitempty"`
+}
+
 type WakeTaskRequest struct {
 	Text          string `json:"text,omitempty"`
 	DraftVersion  int    `json:"draft_version"`
 	IsFinale      bool   `json:"is_finale,omitempty"`
+	SkillID       string `json:"skill_id,omitempty"`
+	Model         string `json:"model,omitempty"`
 	NovelName     string `json:"novel_name,omitempty"`
 	VolumeName    string `json:"volume_name,omitempty"`
 	ChapterNumber int    `json:"chapter_number,omitempty"`
@@ -172,6 +181,17 @@ type TaskBusyError struct {
 	TaskID    string `json:"task_id"`
 	SessionID string `json:"existing_session_id"`
 	Message   string `json:"error"`
+}
+
+type CreateTaskRequest struct {
+	TaskID    string `json:"task_id"`
+	Topic     string `json:"topic"`
+	UID       string `json:"uid"`
+	Platform  string `json:"platform"`
+	SkillID   string `json:"skill_id"`
+	Model     string `json:"model"`
+	AccountID string `json:"account_id,omitempty"`
+	NovelName string `json:"novel_name,omitempty"`
 }
 
 func (e *TaskBusyError) Error() string {

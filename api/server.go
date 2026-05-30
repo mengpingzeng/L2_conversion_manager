@@ -2,11 +2,11 @@ package api
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"clawstudios/pkg/logging"
 
@@ -15,24 +15,17 @@ import (
 	"session_manager/store"
 
 	"github.com/gorilla/mux"
-	"github.com/gorilla/websocket"
 )
 
 type Server struct {
-	sm       *manager.SessionManager
-	router   *mux.Router
-	upgrader websocket.Upgrader
+	sm     *manager.SessionManager
+	router *mux.Router
 }
 
 func NewServer(sm *manager.SessionManager) *Server {
 	s := &Server{
 		sm:     sm,
 		router: mux.NewRouter(),
-		upgrader: websocket.Upgrader{
-			CheckOrigin:     func(r *http.Request) bool { return true },
-			ReadBufferSize:  1024,
-			WriteBufferSize: 1024,
-		},
 	}
 	s.registerRoutes()
 	return s
@@ -50,12 +43,15 @@ func (s *Server) registerRoutes() {
 	api.HandleFunc("/skill/list", s.handleListSkills).Methods("GET")
 
 	api.HandleFunc("/task/list", s.handleTaskList).Methods("GET")
+	api.HandleFunc("/task/skill-ids", s.handleTaskSkillIDs).Methods("GET")
+	api.HandleFunc("/task/create", s.handleTaskCreate).Methods("POST")
 	api.HandleFunc("/task/{id}", s.handleTaskGet).Methods("GET")
 	api.HandleFunc("/task/{id}/wake", s.handleTaskWake).Methods("POST")
+	api.HandleFunc("/task/{id}/message", s.handleTaskMessage).Methods("POST")
 	api.HandleFunc("/task/{id}/update", s.handleTaskUpdate).Methods("POST")
 	api.HandleFunc("/task/{id}/sessions", s.handleTaskSessions).Methods("GET")
 	api.HandleFunc("/task/{id}/messages", s.handleTaskMessages).Methods("GET")
-	api.HandleFunc("/task/{id}/stream", s.handleTaskStream).Methods("GET")
+	api.HandleFunc("/task/{id}/messages", s.handleTaskMessagesClear).Methods("DELETE")
 	api.HandleFunc("/task/{id}/timeline", s.handleTaskTimeline).Methods("GET")
 	api.HandleFunc("/task/{id}", s.handleTaskDelete).Methods("DELETE")
 
@@ -63,7 +59,6 @@ func (s *Server) registerRoutes() {
 	api.HandleFunc("/session/{id}/send", s.handleSend).Methods("POST")
 	api.HandleFunc("/session/{id}/close", s.handleClose).Methods("POST")
 	api.HandleFunc("/session/{id}", s.handleGetSession).Methods("GET")
-	api.HandleFunc("/session/{id}/stream", s.handleStream).Methods("GET")
 	api.HandleFunc("/session/{id}/draft", s.handleGetDraft).Methods("GET")
 
 	api.HandleFunc("/sessions", s.handleListSessions).Methods("GET")
@@ -100,6 +95,57 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+func stripSessionListDecisions(sessions []*models.Session) []*models.Session {
+	if sessions == nil {
+		return nil
+	}
+	out := make([]*models.Session, len(sessions))
+	for i, s := range sessions {
+		cp := *s
+		if len(cp.Episodes) > 0 {
+			eps := make([]models.Episode, len(cp.Episodes))
+			for j, e := range cp.Episodes {
+				e.Decisions = ""
+				eps[j] = e
+			}
+			cp.Episodes = eps
+		}
+		out[i] = &cp
+	}
+	return out
+}
+
+func (s *Server) handleTaskCreate(w http.ResponseWriter, r *http.Request) {
+	logger := logging.FromContext(r.Context())
+
+	var req models.CreateTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if logger != nil {
+			logger.Error(logging.ErrInvalidParam, "decode create task request failed: %v", err)
+		}
+		writeError(w, 400, "invalid request body: "+err.Error())
+		return
+	}
+
+	if req.TaskID == "" {
+		writeError(w, 400, "task_id is required")
+		return
+	}
+
+	if err := s.sm.CreateTaskDirect(req); err != nil {
+		if logger != nil {
+			logger.Error(logging.ErrDatabaseError, "CreateTaskDirect(%s) failed: %v", req.TaskID, err)
+		}
+		writeError(w, 500, "failed to create task: "+err.Error())
+		return
+	}
+
+	writeJSON(w, 200, map[string]interface{}{
+		"task_id": req.TaskID,
+		"created": true,
+	})
+}
+
 func (s *Server) handleTaskList(w http.ResponseWriter, r *http.Request) {
 	uid := r.URL.Query().Get("uid")
 	search := r.URL.Query().Get("q")
@@ -124,6 +170,16 @@ func (s *Server) handleTaskList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{
 		"tasks": tasks,
 		"total": total,
+	})
+}
+
+func (s *Server) handleTaskSkillIDs(w http.ResponseWriter, r *http.Request) {
+	ids := s.sm.ListTaskSkillIDs()
+	if ids == nil {
+		ids = []string{}
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"skill_ids": ids,
 	})
 }
 
@@ -176,6 +232,41 @@ func (s *Server) handleTaskWake(w http.ResponseWriter, r *http.Request) {
 		"task_id":    sess.TaskID,
 		"status":     sess.Status,
 		"cwd_path":   sess.CWDPath,
+	})
+}
+
+func (s *Server) handleTaskMessage(w http.ResponseWriter, r *http.Request) {
+	logger := logging.FromContext(r.Context())
+	taskID := mux.Vars(r)["id"]
+
+	var req models.TaskMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if logger != nil {
+			logger.Error(logging.ErrInvalidParam, "decode request body failed: %v", err)
+		}
+		writeError(w, 400, "invalid request body: "+err.Error())
+		return
+	}
+	if req.Text == "" {
+		writeError(w, 400, "text is required")
+		return
+	}
+
+	if err := s.sm.SendTaskMessage(r.Context(), taskID, req); err != nil {
+		if logger != nil {
+			logger.Error(logging.ErrSessionError, "SendTaskMessage(%s) failed: %v", taskID, err)
+		}
+		if strings.Contains(err.Error(), "当前章节已发布") {
+			writeError(w, 400, err.Error())
+			return
+		}
+		writeError(w, 500, "failed to send task message: "+err.Error())
+		return
+	}
+
+	writeJSON(w, 200, map[string]interface{}{
+		"accepted": true,
+		"message":  "message queued, stream events via task WebSocket",
 	})
 }
 
@@ -241,7 +332,7 @@ func (s *Server) handleTaskSessions(w http.ResponseWriter, r *http.Request) {
 		logger.Info("sessions listed: task=%s count=%d", taskID, len(sessions))
 	}
 	writeJSON(w, 200, map[string]interface{}{
-		"sessions": sessions,
+		"sessions": stripSessionListDecisions(sessions),
 		"count":    len(sessions),
 	})
 }
@@ -263,32 +354,19 @@ func (s *Server) handleTaskMessages(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleTaskStream(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleTaskMessagesClear(w http.ResponseWriter, r *http.Request) {
 	logger := logging.FromContext(r.Context())
 	taskID := mux.Vars(r)["id"]
-
-	conn, err := s.upgrader.Upgrade(w, r, nil)
-	if err != nil {
+	if err := s.sm.ClearTaskMessages(taskID); err != nil {
 		if logger != nil {
-			logger.Error(logging.ErrInternal, "ws upgrade failed for task %s: %v", taskID, err)
+			logger.Error(logging.ErrDatabaseError, "ClearTaskMessages(%s) failed: %v", taskID, err)
 		}
-		log.Printf("task ws upgrade failed: %v", err)
+		writeError(w, 500, "failed to clear task messages: "+err.Error())
 		return
 	}
-	defer conn.Close()
-
-	ch := s.sm.SubscribeTask(taskID)
-	defer s.sm.UnsubscribeTask(taskID, ch)
-
-	for evt := range ch {
-		data, err := json.Marshal(evt)
-		if err != nil {
-			continue
-		}
-		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
-			break
-		}
-	}
+	writeJSON(w, 200, map[string]interface{}{
+		"cleared": true,
+	})
 }
 
 type timelineEvent struct {
@@ -547,7 +625,7 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 		sessions = []*models.Session{}
 	}
 	writeJSON(w, 200, map[string]interface{}{
-		"sessions": sessions,
+		"sessions": stripSessionListDecisions(sessions),
 		"count":    len(sessions),
 	})
 }
@@ -604,32 +682,4 @@ func (s *Server) handleGetDraft(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, 200, resp)
-}
-
-func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
-	logger := logging.FromContext(r.Context())
-	sessionID := mux.Vars(r)["id"]
-
-	conn, err := s.upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		if logger != nil {
-			logger.Error(logging.ErrInternal, "ws upgrade failed for session %s: %v", sessionID, err)
-		}
-		log.Printf("ws upgrade failed: %v", err)
-		return
-	}
-	defer conn.Close()
-
-	ch := s.sm.Subscribe(sessionID)
-	defer s.sm.Unsubscribe(sessionID, ch)
-
-	for evt := range ch {
-		data, err := json.Marshal(evt)
-		if err != nil {
-			continue
-		}
-		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
-			break
-		}
-	}
 }

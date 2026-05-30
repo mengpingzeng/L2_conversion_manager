@@ -32,6 +32,7 @@ type Config struct {
 	MaxTokensPerEpoch   int
 	StaleTimeoutMin     int
 	DeepseekAPIKey      string
+	SkillRegistryURL    string
 }
 
 func DefaultConfig() Config {
@@ -47,6 +48,11 @@ func DefaultConfig() Config {
 	}
 }
 
+type taskRunGate struct {
+	mu      sync.Mutex
+	running bool
+}
+
 type SessionManager struct {
 	cfg        Config
 	configPath string
@@ -55,11 +61,36 @@ type SessionManager struct {
 	runner     *runner.OpenCodeRunner
 	skills     map[string]adapter.SkillDef
 
-	mu              sync.RWMutex
-	subscribers     map[string][]chan models.SessionEvent
-	taskSubscribers map[string][]chan models.SessionEvent
+	skillRegistryURL string
+	fetchedSkills    map[string]adapter.SkillDef
+	fetchedMu        sync.RWMutex
+
+	taskRunGates    sync.Map // taskID -> *taskRunGate
 
 	stopCh chan struct{}
+}
+
+func (sm *SessionManager) tryAcquireTaskRun(taskID string) bool {
+	v, _ := sm.taskRunGates.LoadOrStore(taskID, &taskRunGate{})
+	g := v.(*taskRunGate)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.running {
+		return false
+	}
+	g.running = true
+	return true
+}
+
+func (sm *SessionManager) releaseTaskRun(taskID string) {
+	v, ok := sm.taskRunGates.Load(taskID)
+	if !ok {
+		return
+	}
+	g := v.(*taskRunGate)
+	g.mu.Lock()
+	g.running = false
+	g.mu.Unlock()
 }
 
 func New(cfg Config) (*SessionManager, error) {
@@ -93,14 +124,14 @@ func New(cfg Config) (*SessionManager, error) {
 	}
 
 	sm := &SessionManager{
-		cfg:             cfg,
-		store:           s,
-		pool:            p,
-		runner:          ocRunner,
-		skills:          skills,
-		subscribers:     make(map[string][]chan models.SessionEvent),
-		taskSubscribers: make(map[string][]chan models.SessionEvent),
-		stopCh:          make(chan struct{}),
+		cfg:              cfg,
+		store:            s,
+		pool:             p,
+		runner:           ocRunner,
+		skills:           skills,
+		skillRegistryURL: cfg.SkillRegistryURL,
+		fetchedSkills:    make(map[string]adapter.SkillDef),
+		stopCh:           make(chan struct{}),
 	}
 
 	if err := sm.initOpenCodeConfig(); err != nil {
@@ -116,10 +147,43 @@ func (sm *SessionManager) Stop() {
 	close(sm.stopCh)
 }
 
+func (sm *SessionManager) ListTaskSkillIDs() []string {
+	return sm.store.ListTaskSkillIDs()
+}
+
+func (sm *SessionManager) resolveSkill(ctx context.Context, skillID string) (adapter.SkillDef, error) {
+	if skill, ok := sm.skills[skillID]; ok {
+		return skill, nil
+	}
+
+	sm.fetchedMu.RLock()
+	if skill, ok := sm.fetchedSkills[skillID]; ok {
+		sm.fetchedMu.RUnlock()
+		return skill, nil
+	}
+	sm.fetchedMu.RUnlock()
+
+	if sm.skillRegistryURL == "" {
+		return adapter.SkillDef{}, fmt.Errorf("skill not found: %s (no registry configured)", skillID)
+	}
+
+	fetched, err := adapter.FetchSkillFromL1(ctx, sm.skillRegistryURL, skillID)
+	if err != nil {
+		return adapter.SkillDef{}, fmt.Errorf("fetch skill %s: %w", skillID, err)
+	}
+
+	sm.fetchedMu.Lock()
+	sm.fetchedSkills[skillID] = fetched
+	sm.fetchedMu.Unlock()
+
+	return fetched, nil
+}
+
 func (sm *SessionManager) initOpenCodeConfig() error {
 	configPath := filepath.Join(sm.cfg.DataDir, "opencode_config.json")
 
 	skillsDir := sm.store.SkillsDir()
+	tasksDir := filepath.Join(sm.cfg.DataDir, "tasks")
 
 	existing := make(map[string]interface{})
 	if data, err := os.ReadFile(configPath); err == nil {
@@ -131,8 +195,12 @@ func (sm *SessionManager) initOpenCodeConfig() error {
 		"bash":               "deny",
 		"write":              "allow",
 		"read":               "allow",
-		"external_directory": "deny",
-		"doom_loop":          "allow",
+		"external_directory": map[string]interface{}{
+			skillsDir + "/*": "allow",
+			tasksDir + "/*":  "allow",
+			"/tmp/opencode/*": "allow",
+		},
+		"doom_loop": "allow",
 	}
 	existing["skills"] = map[string]interface{}{
 		"paths": []string{skillsDir},
@@ -215,28 +283,7 @@ func (sm *SessionManager) checkTaskConcurrency(taskID string, now time.Time) err
 	}
 }
 
-func (sm *SessionManager) Create(ctx context.Context, req models.CreateSessionRequest) (*models.Session, error) {
-	if req.TaskID == "" {
-		return nil, fmt.Errorf("task_id is required")
-	}
-	if req.Topic == "" {
-		return nil, fmt.Errorf("topic is required")
-	}
-	if req.SkillID == "" {
-		req.SkillID = "general_fallback_v1"
-	}
-
-	skill, ok := sm.skills[req.SkillID]
-	if !ok {
-		return nil, fmt.Errorf("skill not found: %s", req.SkillID)
-	}
-
-	now := time.Now()
-	if err := sm.checkTaskConcurrency(req.TaskID, now); err != nil {
-		return nil, err
-	}
-
-	model := req.Model
+func (sm *SessionManager) normalizeModel(model string) string {
 	if model == "" {
 		model = sm.cfg.DefaultModel
 	}
@@ -249,19 +296,44 @@ func (sm *SessionManager) Create(ctx context.Context, req models.CreateSessionRe
 			model = strings.Replace(model, "deepseek/", "team-deepseek/", 1)
 		}
 	}
+	return model
+}
 
-	task, isNew, err := sm.store.GetOrCreateTask(req.TaskID, req.Topic, req.UID, req.MemoryModel, req.Platform, req.SkillID, model, req.AccountID)
+func (sm *SessionManager) Create(ctx context.Context, req models.CreateSessionRequest) (*models.Session, error) {
+	if req.TaskID == "" {
+		return nil, fmt.Errorf("task_id is required")
+	}
+	if req.Topic == "" {
+		return nil, fmt.Errorf("topic is required")
+	}
+	if req.SkillID == "" {
+		req.SkillID = "general_fallback_v1"
+	}
+
+	skill, err := sm.resolveSkill(ctx, req.SkillID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve skill %s: %w", req.SkillID, err)
+	}
+
+	now := time.Now()
+	if err := sm.checkTaskConcurrency(req.TaskID, now); err != nil {
+		return nil, err
+	}
+
+	model := sm.normalizeModel(req.Model)
+
+	task, isNew, err := sm.store.GetOrCreateTask(req.TaskID, req.Topic, req.UID, req.MemoryModel, req.Platform, req.SkillID, model, req.AccountID, req.NovelName)
 	if err != nil {
 		return nil, fmt.Errorf("init task: %w", err)
 	}
 
 	sessionID := uuid.New().String()[:8]
 
-	ok, existingSID, err := sm.store.TrySetActiveSession(req.TaskID, sessionID)
+	activeOK, existingSID, err := sm.store.TrySetActiveSession(req.TaskID, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("set active session: %w", err)
 	}
-	if !ok {
+	if !activeOK {
 		return nil, &models.TaskBusyError{
 			TaskID:    req.TaskID,
 			SessionID: existingSID,
@@ -336,7 +408,7 @@ func (sm *SessionManager) injectTaskContext(cwd, taskID string) {
 		if err == nil && len(sessions) > 0 {
 			var validSessions []*models.Session
 			for _, s := range sessions {
-				if s.Status != models.StatusCreated && s.Status != models.StatusGenerating {
+				if s.Status != models.StatusCreated && s.Status != models.StatusGenerating && s.ChapterNumber > 0 {
 					validSessions = append(validSessions, s)
 				}
 			}
@@ -380,6 +452,41 @@ func (sm *SessionManager) injectTaskContext(cwd, taskID string) {
 	}
 }
 
+func (sm *SessionManager) chatOpenCodeSessionPath(cwd string) string {
+	return filepath.Join(cwd, ".opencode_session")
+}
+
+func (sm *SessionManager) loadChatOpenCodeSession(cwd string) string {
+	data, err := os.ReadFile(sm.chatOpenCodeSessionPath(cwd))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func (sm *SessionManager) saveChatOpenCodeSession(cwd, sid string) {
+	if sid == "" {
+		return
+	}
+	_ = os.WriteFile(sm.chatOpenCodeSessionPath(cwd), []byte(sid), 0644)
+}
+
+func (sm *SessionManager) resolveChapterNoticeMeta(taskID, sessionID string, sess *models.Session, draftPath string) (int, string) {
+	if sess == nil && sessionID != "" && taskID != "" {
+		if s, err := sm.store.GetSession(taskID, sessionID); err == nil {
+			sess = s
+		}
+	}
+	chapterNo := 0
+	if sess != nil && sess.ChapterNumber > 0 {
+		chapterNo = sess.ChapterNumber
+	} else if sess != nil && taskID != "" {
+		chapterNo = sm.inferChapterNumberForSession(taskID, sess)
+	}
+	title := parseDraftChapterTitle(draftPath)
+	return chapterNo, title
+}
+
 func (sm *SessionManager) inferChapterNumberForSession(taskID string, sess *models.Session) int {
 	sessions, err := sm.store.LoadTaskSessions(taskID)
 	if err != nil {
@@ -390,7 +497,7 @@ func (sm *SessionManager) inferChapterNumberForSession(taskID string, sess *mode
 		if s.SessionID == sess.SessionID {
 			return chapNo
 		}
-		if s.Status != models.StatusCreated && s.Status != models.StatusGenerating {
+		if s.Status != models.StatusCreated && s.Status != models.StatusGenerating && s.ChapterNumber > 0 {
 			chapNo++
 		}
 	}
@@ -409,11 +516,15 @@ func (sm *SessionManager) Send(ctx context.Context, sessionID string, req models
 
 	sess.LastActiveAt = time.Now()
 	sess.DraftVersion = req.DraftVersion
+	sess.OpenCodeSID = ""
 	if sess.Status == models.StatusArchived {
 		sess.Status = models.StatusWarm
 		sess.ArchivedAt = nil
 	}
 	_ = sm.store.UpsertSessionInTask(sess)
+	if !sm.tryAcquireTaskRun(taskID) {
+		return fmt.Errorf("上一条消息还在处理中，请稍后再试")
+	}
 	sm.appendTaskMessage(taskID, sessionID, "user", req.Text, req.DraftVersion)
 
 	task, err := sm.store.GetTask(taskID)
@@ -422,12 +533,99 @@ func (sm *SessionManager) Send(ctx context.Context, sessionID string, req models
 		_ = sm.store.UpdateTask(task)
 	}
 
-	go sm.runSessionLoop(context.Background(), sessionID, taskID, sess.CWDPath, sess.Model, req.Text, sess.OpenCodeSID)
+	go func() {
+		defer sm.releaseTaskRun(taskID)
+		sm.runSessionLoop(context.Background(), sessionID, taskID, sess.CWDPath, sess.Model, req.Text, sess.OpenCodeSID, true)
+	}()
 
 	return nil
 }
 
-func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID, cwd, model, message, ocSID string) {
+func (sm *SessionManager) SendTaskMessage(ctx context.Context, taskID string, req models.TaskMessageRequest) error {
+	if req.Text == "" {
+		return fmt.Errorf("text is required")
+	}
+
+	mode := req.Mode
+	if mode == "" {
+		mode = "edit"
+	}
+	task, err := sm.store.GetTask(taskID)
+	if err != nil {
+		return err
+	}
+
+	if mode == "chat" {
+		if !sm.tryAcquireTaskRun(taskID) {
+			return fmt.Errorf("上一条消息还在处理中，请稍后再试")
+		}
+		cwd := filepath.Join(sm.store.TaskDir(taskID), "chat")
+		if err := os.MkdirAll(cwd, 0755); err != nil {
+			sm.releaseTaskRun(taskID)
+			return err
+		}
+		sm.appendTaskMessage(taskID, "", "user", req.Text, req.DraftVersion)
+		task.LastActiveAt = time.Now()
+		_ = sm.store.UpdateTask(task)
+		ocSID := sm.loadChatOpenCodeSession(cwd)
+		go func() {
+			defer sm.releaseTaskRun(taskID)
+			sm.runSessionLoop(context.Background(), "", taskID, cwd, task.Model, req.Text, ocSID, false)
+		}()
+		return nil
+	}
+
+	targetSessionID := req.TargetSessionID
+	if targetSessionID == "" {
+		targetSessionID = task.ActiveSessionID
+		if targetSessionID == "" && len(task.SessionIDs) > 0 {
+			targetSessionID = task.SessionIDs[len(task.SessionIDs)-1]
+		}
+	}
+	if targetSessionID == "" {
+		sm.appendTaskMessage(taskID, "", "user", req.Text, req.DraftVersion)
+		sm.appendTaskMessage(taskID, "", "system", "当前任务没有可修改的章节草稿", req.DraftVersion)
+		return nil
+	}
+
+	for idx, sid := range task.SessionIDs {
+		if sid == targetSessionID && idx+1 <= task.PublishedChapterCount {
+			return fmt.Errorf("当前章节已发布，不能再通过 AI 修改内容")
+		}
+	}
+
+	sess, err := sm.store.GetSession(taskID, targetSessionID)
+	if err != nil {
+		return err
+	}
+	if sess.Status == models.StatusCold {
+		return fmt.Errorf("session is cold, use wake first: %s", targetSessionID)
+	}
+
+	sess.LastActiveAt = time.Now()
+	sess.DraftVersion = req.DraftVersion
+	if sess.Status == models.StatusArchived {
+		sess.Status = models.StatusWarm
+		sess.ArchivedAt = nil
+		sess.OpenCodeSID = ""
+	}
+	_ = sm.store.UpsertSessionInTask(sess)
+	if !sm.tryAcquireTaskRun(taskID) {
+		return fmt.Errorf("上一条消息还在处理中，请稍后再试")
+	}
+	sm.appendTaskMessage(taskID, targetSessionID, "user", req.Text, req.DraftVersion)
+
+	task.LastActiveAt = sess.LastActiveAt
+	_ = sm.store.UpdateTask(task)
+
+	go func() {
+		defer sm.releaseTaskRun(taskID)
+		sm.runSessionLoop(context.Background(), targetSessionID, taskID, sess.CWDPath, sess.Model, req.Text, "", false)
+	}()
+	return nil
+}
+
+func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID, cwd, model, message, ocSID string, writeDraftOnText bool) {
 	logger := logging.NewLogger("SessionWorker",
 		logging.WithTaskID(taskID),
 		logging.WithSessionID(sessionID),
@@ -436,20 +634,25 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 	if err := sm.pool.Acquire(ctx); err != nil {
 		logger.Error(logging.ErrTimeout, "pool acquire failed: session=%s err=%v", sessionID, err)
 		sm.appendTaskMessage(taskID, sessionID, "system", "server busy, please retry later", 0)
-		sm.broadcast(sessionID, models.SessionEvent{
-			Type:      "error",
-			SessionID: sessionID,
-			TaskID:    taskID,
-			Error:     "server busy, please retry later",
-		})
 		return
 	}
 	defer sm.pool.Release()
 
-	logger.Info("pool acquired, session loop start: session=%s task=%s model=%s", sessionID, taskID, model)
+	activeKey, keySource := sm.readActiveAPIKey(model)
+	costStart := sm.logSessionCostStart(logger, sessionID, taskID, model, activeKey, keySource)
 
-	sess, err := sm.store.GetSession(taskID, sessionID)
-	if err == nil && sess.Status == models.StatusCreated {
+	keyShow := activeKey
+	if len(keyShow) > 16 {
+		keyShow = keyShow[:16]
+	}
+	logger.Info("pool acquired, session loop start: session=%s task=%s model=%s key=%s... source=%s", sessionID, taskID, model, keyShow, keySource)
+
+	var sess *models.Session
+	var err error
+	if sessionID != "" {
+		sess, err = sm.store.GetSession(taskID, sessionID)
+	}
+	if err == nil && sess != nil && sess.Status == models.StatusCreated {
 		sess.Status = models.StatusGenerating
 		sess.LastActiveAt = time.Now()
 		_ = sm.store.UpsertSessionInTask(sess)
@@ -460,14 +663,22 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	runCtx = logging.NewContext(runCtx, logger)
+
+	apiKey := sm.cfg.DeepseekAPIKey
+	if apiKey == "" {
+		apiKey = activeKey
+	}
+
 	opts := runner.RunOptions{
-		CWD:            cwd,
-		Model:          model,
-		SessionID:      ocSID,
-		Message:        message,
-		Timeout:        timeout,
-		ConfigPath:     sm.configPath,
-		DeepseekAPIKey: sm.cfg.DeepseekAPIKey,
+		CWD:              cwd,
+		Model:            model,
+		SessionID:        ocSID,
+		Message:          message,
+		Timeout:          timeout,
+		ConfigPath:       sm.configPath,
+		DeepseekAPIKey:   apiKey,
+		WriteDraftOnText: writeDraftOnText,
 	}
 
 	logger.Info("launching opencode: session=%s model=%s cwd=%s", sessionID, model, cwd)
@@ -476,12 +687,6 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 		logger.Error(logging.ErrSessionError, "opencode launch failed: session=%s err=%v", sessionID, err)
 		errText := fmt.Sprintf("failed to start opencode: %v", err)
 		sm.appendTaskMessage(taskID, sessionID, "system", errText, 0)
-		sm.broadcast(sessionID, models.SessionEvent{
-			Type:      "error",
-			SessionID: sessionID,
-			TaskID:    taskID,
-			Error:     errText,
-		})
 		return
 	}
 
@@ -490,6 +695,62 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 	capturedSID := ocSID
 	var textBuf strings.Builder
 	var assistantText strings.Builder
+	assistantPersisted := false
+	var evtCountStepStart, evtCountToken, evtCountToolCall, evtCountStepFinish, evtCountReasoning, evtCountDraftUpdated, evtCountError, evtCountOther int
+	sessionDraftPath := ""
+	var draftBaselineMod time.Time
+	var draftBaselineSize int64
+	if sessionID != "" {
+		sessionDraftPath = filepath.Join(sm.store.GetSessionCWDDir(taskID, sessionID), "current_draft.md")
+		if st, err := os.Stat(sessionDraftPath); err == nil {
+			draftBaselineMod = st.ModTime()
+			draftBaselineSize = st.Size()
+		}
+	}
+
+	emitDraftUpdated := func() {
+		if sessionID == "" || sessionDraftPath == "" {
+			return
+		}
+		st, err := os.Stat(sessionDraftPath)
+		if err != nil || st.Size() == 0 {
+			return
+		}
+		if !st.ModTime().After(draftBaselineMod) && st.Size() == draftBaselineSize {
+			return
+		}
+		version := 0
+		if fresh, getErr := sm.store.GetSession(taskID, sessionID); getErr == nil {
+			version = fresh.DraftVersion
+			if version == 0 {
+				version = fresh.ChapterNumber
+			}
+			if fresh.Status == models.StatusGenerating {
+				fresh.Status = models.StatusDraftReady
+				_ = sm.store.UpsertSessionInTask(fresh)
+			}
+		}
+	}
+
+	persistAssistantMessage := func() {
+		if assistantPersisted {
+			return
+		}
+		chapterNo, chapterTitle := sm.resolveChapterNoticeMeta(taskID, sessionID, sess, sessionDraftPath)
+		display := chatDisplayOrDraftNotice(assistantText.String(), sessionDraftPath, chapterNo, chapterTitle)
+		if strings.TrimSpace(display) == "" {
+			return
+		}
+		version := 0
+		if sess != nil {
+			version = sess.DraftVersion
+		}
+		sm.appendTaskMessage(taskID, sessionID, "assistant", display, version)
+		assistantPersisted = true
+		if isDraftWrittenNotice(display) {
+			emitDraftUpdated()
+		}
+	}
 
 	for evt := range events {
 		if capturedSID == "" && evt.SessionID != "" && evt.SessionID != sessionID {
@@ -499,12 +760,37 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 		evt.SessionID = sessionID
 		evt.TaskID = taskID
 
-		if evt.Type == "token" {
-			textBuf.WriteString(evt.Text)
-			assistantText.WriteString(evt.Text)
+		switch evt.Type {
+		case "step_start":
+			evtCountStepStart++
+		case "token":
+			evtCountToken++
+		case "tool_call":
+			evtCountToolCall++
+		case "step_finish":
+			evtCountStepFinish++
+		case "reasoning":
+			evtCountReasoning++
+		case "draft_updated":
+			evtCountDraftUpdated++
+		case "error":
+			evtCountError++
+		default:
+			evtCountOther++
 		}
 
-		if evt.Type == "step_start" && capturedSID != "" {
+		if evt.Type == "token" || (evt.Type == "step_finish" && strings.TrimSpace(evt.Text) != "") {
+			if evt.Text != "" {
+				textBuf.WriteString(evt.Text)
+				assistantText.WriteString(evt.Text)
+			}
+		}
+
+		if evt.Type == "reasoning" && evt.Text != "" {
+			textBuf.WriteString(evt.Text)
+		}
+
+		if sessionID != "" && evt.Type == "step_start" && capturedSID != "" {
 			sess, err := sm.store.GetSession(taskID, sessionID)
 			if err == nil && sess.OpenCodeSID == "" {
 				sess.OpenCodeSID = capturedSID
@@ -516,16 +802,21 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 			totalTokens += evt.Tokens.Total
 		}
 
-		if evt.Type == "tool_call" && evt.DraftPath != "" && evt.ToolResult != "" {
-			sm.broadcast(sessionID, models.SessionEvent{
-				Type:      "draft_updated",
-				SessionID: sessionID,
-				TaskID:    taskID,
-				DraftPath: evt.DraftPath,
-			})
+		if evt.Type == "tool_call" && evt.DraftPath != "" && (evt.ToolResult != "" || isWriteToolName(evt.Tool)) {
+			emitDraftUpdated()
 		}
 
-		if (evt.Type == "step_finish" || evt.Type == "done") && textBuf.Len() > 0 {
+		if evt.Type == "done" || evt.Type == "step_finish" {
+			if strings.TrimSpace(assistantText.String()) != "" {
+				persistAssistantMessage()
+			} else if sessionDraftPath != "" {
+				if info, err := os.Stat(sessionDraftPath); err == nil && info.Size() > 0 {
+					persistAssistantMessage()
+				}
+			}
+		}
+
+		if writeDraftOnText && (evt.Type == "step_finish" || evt.Type == "done") && textBuf.Len() > 0 {
 			cwd := sm.store.GetSessionCWDDir(taskID, sessionID)
 			draftPath := filepath.Join(cwd, "current_draft.md")
 			newContent := []byte(textBuf.String())
@@ -535,12 +826,6 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 			}
 			if write {
 				if err := os.WriteFile(draftPath, newContent, 0644); err == nil {
-					sm.broadcast(sessionID, models.SessionEvent{
-						Type:      "draft_updated",
-						SessionID: sessionID,
-						TaskID:    taskID,
-						DraftPath: draftPath,
-					})
 					if draftSess, getErr := sm.store.GetSession(taskID, sessionID); getErr == nil && draftSess.Status == models.StatusGenerating {
 						draftSess.Status = models.StatusDraftReady
 						_ = sm.store.UpsertSessionInTask(draftSess)
@@ -550,31 +835,71 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 			}
 		}
 
+		if evt.Type == "done" {
+			emitDraftUpdated()
+		}
+
+		if evt.Type == "done" && !assistantPersisted && strings.TrimSpace(assistantText.String()) == "" {
+			draftExists := false
+			if sessionDraftPath != "" {
+				if info, err := os.Stat(sessionDraftPath); err == nil && info.Size() > 0 {
+					draftExists = true
+				}
+			}
+			if !draftExists {
+				logger.Warn(logging.WarnProcessStuck, "opencode returned no content: session=%s task=%s model=%s text_buf_len=%d total_tokens=%d msg_count=%d events(step_start=%d token=%d tool_call=%d step_finish=%d reasoning=%d draft_updated=%d error=%d other=%d)",
+					sessionID, taskID, model, textBuf.Len(), totalTokens, msgCount,
+					evtCountStepStart, evtCountToken, evtCountToolCall, evtCountStepFinish, evtCountReasoning, evtCountDraftUpdated, evtCountError, evtCountOther)
+				errMsg := "AI 未返回内容，请重试"
+				evt = models.SessionEvent{
+					Type:      "error",
+					SessionID: sessionID,
+					TaskID:    taskID,
+					Error:     errMsg,
+				}
+			}
+		}
+
 		if evt.Type == "token" || evt.Type == "tool_call" || evt.Type == "step_finish" ||
-			evt.Type == "done" || evt.Type == "error" || evt.Type == "draft_updated" {
+			evt.Type == "done" || evt.Type == "error" || evt.Type == "draft_updated" ||
+			evt.Type == "reasoning" {
 			if evt.Type == "error" && evt.Error != "" {
 				sm.appendTaskMessage(taskID, sessionID, "system", evt.Error, 0)
 			}
-			sm.broadcast(sessionID, evt)
+			out := evt
+			if out.Type == "token" {
+				if writeDraftOnText {
+					out.Text = ""
+				} else if out.Text != "" {
+					out.Text = chatDisplayTextDelta(assistantText.String(), sessionDraftPath, out.Text)
+				}
+			}
+			if out.Type == "step_finish" && out.Text != "" {
+				out.Text = ChatDisplayText(out.Text, sessionDraftPath)
+			}
 		}
 	}
 
-	sessionCwd := sm.store.GetSessionCWDDir(taskID, sessionID)
-	chkPath := filepath.Join(sessionCwd, "current_draft.md")
-	if data, err := os.ReadFile(chkPath); err == nil && len(data) > 0 {
-		firstLine := strings.TrimSpace(strings.SplitN(string(data), "\n", 2)[0])
-		if !strings.HasPrefix(firstLine, "# 第") || !strings.Contains(firstLine, "章") {
-			chapterNo := sm.inferChapterNumberForSession(taskID, sess)
-			newContent := fmt.Sprintf("# 第%d章\n\n%s", chapterNo, string(data))
-			if err := os.WriteFile(chkPath, []byte(newContent), 0644); err == nil {
-				logger.Info("chapter title auto-fixed: session=%s chapter=%d", sessionID, chapterNo)
+	if sessionID != "" {
+		sessionCwd := sm.store.GetSessionCWDDir(taskID, sessionID)
+		chkPath := filepath.Join(sessionCwd, "current_draft.md")
+		if data, err := os.ReadFile(chkPath); err == nil && len(data) > 0 {
+			firstLine := strings.TrimSpace(strings.SplitN(string(data), "\n", 2)[0])
+			if !strings.HasPrefix(firstLine, "# 第") || !strings.Contains(firstLine, "章") {
+				chapterNo := sm.inferChapterNumberForSession(taskID, sess)
+				newContent := fmt.Sprintf("# 第%d章\n\n%s", chapterNo, string(data))
+				if err := os.WriteFile(chkPath, []byte(newContent), 0644); err == nil {
+					logger.Info("chapter title auto-fixed: session=%s chapter=%d", sessionID, chapterNo)
+				}
 			}
 		}
 	}
 
 	msgCount++
-	sess, err = sm.store.GetSession(taskID, sessionID)
-	if err == nil {
+	if sessionID != "" {
+		sess, err = sm.store.GetSession(taskID, sessionID)
+	}
+	if sessionID != "" && err == nil {
 		fresh, freshErr := sm.store.GetSession(taskID, sessionID)
 		if freshErr == nil {
 			sess = fresh
@@ -589,6 +914,9 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 			sess.TotalTokens += totalTokens
 			sess.LastActiveAt = time.Now()
 			sess.Status = models.StatusWarm
+			if sess.DraftVersion == 0 {
+				sess.DraftVersion = sess.ChapterNumber
+			}
 			logger.Info("status changed: -> WARM: session=%s msg_count=%d total_tokens=%d draft_version=%d",
 				sessionID, sess.MessageCount, sess.TotalTokens, sess.DraftVersion)
 		}
@@ -598,7 +926,7 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 		_ = sm.store.UpsertSessionInTask(sess)
 
 		if sess.DraftVersion > 0 {
-			sm.saveDraftVersion(taskID, sessionID, sess.DraftVersion)
+			sm.saveDraftVersion(taskID, sessionID, sess.DraftVersion, logger)
 		}
 
 		if sess.MessageCount >= sm.cfg.MaxMessagesPerEpoch || sess.TotalTokens >= sm.cfg.MaxTokensPerEpoch {
@@ -613,30 +941,98 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 		task.LastActiveAt = time.Now()
 		_ = sm.store.UpdateTask(task)
 	}
-	_ = sm.store.ClearActiveSession(taskID, sessionID)
+	if sessionID != "" {
+		_ = sm.store.ClearActiveSession(taskID, sessionID)
+	}
 
 	if strings.TrimSpace(assistantText.String()) != "" {
-		version := 0
-		if sess != nil {
-			version = sess.DraftVersion
+		persistAssistantMessage()
+	}
+
+	if sessionID == "" && capturedSID != "" {
+		sm.saveChatOpenCodeSession(cwd, capturedSID)
+	}
+
+	if sessionID != "" {
+		sessionCwd := sm.store.GetSessionCWDDir(taskID, sessionID)
+		draftPath := filepath.Join(sessionCwd, "current_draft.md")
+		if info, err := os.Stat(draftPath); err == nil {
+			logger.Info("draft file exists: session=%s path=%s size=%d bytes", sessionID, draftPath, info.Size())
+		} else {
+			logger.Warn(logging.WarnProcessStuck, "draft file not found: session=%s path=%s assistant_persisted=%v text_buf_len=%d", sessionID, draftPath, assistantPersisted, textBuf.Len())
 		}
-		sm.appendTaskMessage(taskID, sessionID, "assistant", assistantText.String(), version)
 	}
 
 	logger.Info("session loop done: session=%s opencode_sid=%s", sessionID, capturedSID)
+	sm.logSessionCostEnd(logger, sessionID, taskID, model, totalTokens, costStart)
 	logger.Close()
 }
 
-func (sm *SessionManager) saveDraftVersion(taskID, sessionID string, version int) {
+func (sm *SessionManager) readActiveAPIKey(model string) (key, source string) {
+	configPath := sm.configPath
+	if configPath == "" {
+		return "", "no_config_path"
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return "", "config_not_found"
+	}
+	var cfg struct {
+		Provider map[string]struct {
+			APIKey string `json:"api_key"`
+		} `json:"provider"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return "", "invalid_config"
+	}
+	if p, ok := cfg.Provider["team-deepseek"]; ok && p.APIKey != "" {
+		return p.APIKey, "L1_AI_Provider_config"
+	}
+	return "", "no_team-deepseek_provider"
+}
+
+func (sm *SessionManager) logSessionCostStart(logger *logging.Logger, sessionID, taskID, model, keyFull, keySource string) time.Time {
+	now := time.Now()
+	keyPrefix := keyFull
+	if len(keyPrefix) > 16 {
+		keyPrefix = keyPrefix[:16]
+	}
+	logger.Info("💰 SESSION_COST_START: session=%s task=%s model=%s key=%s... source=%s time=%s",
+		sessionID, taskID, model, keyPrefix, keySource, now.Format("15:04:05"))
+	return now
+}
+
+func (sm *SessionManager) logSessionCostEnd(logger *logging.Logger, sessionID, taskID, model string, totalTokens int, costStart time.Time) {
+	duration := time.Since(costStart)
+	costUSD := estimateCost(model, totalTokens)
+	costCNY := costUSD * 7.2
+	logger.Info("💰 SESSION_COST_END: session=%s task=%s model=%s tokens=%d cost=$%.6f cost≈¥%.6f duration=%s",
+		sessionID, taskID, model, totalTokens, costUSD, costCNY, duration.Round(time.Second).String())
+}
+
+func estimateCost(model string, tokens int) float64 {
+	var rate float64 = 0.00000050
+	switch {
+	case strings.Contains(model, "v4-pro"):
+		rate = 0.00000100
+	case strings.Contains(model, "v4-flash"):
+		rate = 0.00000025
+	default:
+		rate = 0.00000050
+	}
+	return float64(tokens) * rate
+}
+
+func (sm *SessionManager) saveDraftVersion(taskID, sessionID string, version int, logger *logging.Logger) {
 	cwd := sm.store.GetSessionCWDDir(taskID, sessionID)
 	currentDraft := filepath.Join(cwd, "current_draft.md")
 	data, err := os.ReadFile(currentDraft)
 	if err != nil {
-		log.Printf("WARN: failed to read current_draft.md for versioning: %v", err)
+		logger.Warn(logging.WarnProcessStuck, "failed to read current_draft.md for versioning: session=%s version=%d err=%v", sessionID, version, err)
 		return
 	}
 	if err := sm.store.SaveDraftVersion(taskID, version, string(data)); err != nil {
-		log.Printf("WARN: failed to save draft_v%d.md: %v", version, err)
+		logger.Warn(logging.WarnProcessStuck, "failed to save draft_v%d.md: session=%s err=%v", version, sessionID, err)
 	}
 }
 
@@ -704,12 +1100,6 @@ func (sm *SessionManager) Close(ctx context.Context, sessionID string) error {
 		}
 	}
 
-	sm.broadcast(sessionID, models.SessionEvent{
-		Type:      "session_closed",
-		SessionID: sessionID,
-		TaskID:    taskID,
-	})
-
 	if len(draftData) > 0 {
 		go sm.generateMediumSummary(taskID, sessionID, task, sess.SkillID, draftData)
 	}
@@ -740,6 +1130,11 @@ func (sm *SessionManager) generateMediumSummary(taskID, sessionID string, task *
 	summaryCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
+	summaryKey := sm.cfg.DeepseekAPIKey
+	if summaryKey == "" {
+		summaryKey, _ = sm.readActiveAPIKey(summaryModel)
+	}
+
 	opts := runner.RunOptions{
 		CWD:            tmpDir,
 		Model:          summaryModel,
@@ -747,7 +1142,7 @@ func (sm *SessionManager) generateMediumSummary(taskID, sessionID string, task *
 		Message:        prompt,
 		Timeout:        120 * time.Second,
 		ConfigPath:     sm.configPath,
-		DeepseekAPIKey: sm.cfg.DeepseekAPIKey,
+		DeepseekAPIKey: summaryKey,
 	}
 
 	events, err := sm.runner.Run(summaryCtx, opts)
@@ -808,20 +1203,23 @@ func (sm *SessionManager) WakeTask(ctx context.Context, taskID string, req model
 		return nil, err
 	}
 
-	skillID := "general_fallback_v1"
-	if len(task.SessionIDs) > 0 {
-		sessions, _ := sm.store.LoadTaskSessions(taskID)
-		if sessions != nil && len(sessions) > 0 {
-			lastSession := sessions[len(sessions)-1]
-			if lastSession.SkillID != "" {
-				skillID = lastSession.SkillID
+	skillID := req.SkillID
+	if skillID == "" {
+		skillID = "general_fallback_v1"
+		if len(task.SessionIDs) > 0 {
+			sessions, _ := sm.store.LoadTaskSessions(taskID)
+			if sessions != nil && len(sessions) > 0 {
+				lastSession := sessions[len(sessions)-1]
+				if lastSession.SkillID != "" {
+					skillID = lastSession.SkillID
+				}
 			}
 		}
 	}
 
-	skill, ok := sm.skills[skillID]
-	if !ok {
-		skill = sm.skills["general_fallback_v1"]
+	skill, err := sm.resolveSkill(ctx, skillID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve skill %s: %w", skillID, err)
 	}
 
 	sessionID := uuid.New().String()[:8]
@@ -850,7 +1248,11 @@ func (sm *SessionManager) WakeTask(ctx context.Context, taskID string, req model
 
 	sm.injectTaskContext(cwd, taskID)
 
-	model := sm.cfg.DefaultModel
+	model := req.Model
+	if model == "" {
+		model = task.Model
+	}
+	model = sm.normalizeModel(model)
 
 	novelName := req.NovelName
 	if novelName == "" {
@@ -859,6 +1261,9 @@ func (sm *SessionManager) WakeTask(ctx context.Context, taskID string, req model
 	volumeName := req.VolumeName
 	if volumeName == "" {
 		volumeName = task.VolumeName
+	}
+	if volumeName == "" {
+		volumeName = "第一卷"
 	}
 	chapterNumber := req.ChapterNumber
 	if chapterNumber <= 0 {
@@ -907,16 +1312,16 @@ func (sm *SessionManager) WakeTask(ctx context.Context, taskID string, req model
 		}
 	}
 
-	chapterNum := task.SessionCount + 1
+	chapterNum := task.SessionCount
 
 	var msg string
 	if req.IsFinale {
 		msg = adapter.BuildFinaleMessage(task.Topic, skill, req.Text, hasShort, hasMed, chapterNum)
 	} else {
-		msg = adapter.BuildWakeMessage(task.Topic, skill, req.Text, hasShort, hasMed, chapterNum)
+		msg = adapter.BuildStartMessage(novelName, skill, req.Text, chapterNum)
 	}
 
-	go sm.runSessionLoop(context.Background(), sessionID, taskID, cwd, model, msg, "")
+	go sm.runSessionLoop(context.Background(), sessionID, taskID, cwd, model, msg, "", true)
 
 	return sess, nil
 }
@@ -1035,75 +1440,12 @@ func (sm *SessionManager) PoolStatus() string {
 	return sm.pool.Status()
 }
 
-func (sm *SessionManager) Subscribe(sessionID string) chan models.SessionEvent {
-	ch := make(chan models.SessionEvent, 100)
-	sm.mu.Lock()
-	sm.subscribers[sessionID] = append(sm.subscribers[sessionID], ch)
-	sm.mu.Unlock()
-	return ch
-}
-
-func (sm *SessionManager) SubscribeTask(taskID string) chan models.SessionEvent {
-	ch := make(chan models.SessionEvent, 100)
-	sm.mu.Lock()
-	sm.taskSubscribers[taskID] = append(sm.taskSubscribers[taskID], ch)
-	sm.mu.Unlock()
-	return ch
-}
-
-func (sm *SessionManager) Unsubscribe(sessionID string, ch chan models.SessionEvent) {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	subs := sm.subscribers[sessionID]
-	for i, sub := range subs {
-		if sub == ch {
-			sm.subscribers[sessionID] = append(subs[:i], subs[i+1:]...)
-			close(ch)
-			return
-		}
-	}
-}
-
-func (sm *SessionManager) UnsubscribeTask(taskID string, ch chan models.SessionEvent) {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	subs := sm.taskSubscribers[taskID]
-	for i, sub := range subs {
-		if sub == ch {
-			sm.taskSubscribers[taskID] = append(subs[:i], subs[i+1:]...)
-			close(ch)
-			return
-		}
-	}
-}
-
-func (sm *SessionManager) broadcast(sessionID string, evt models.SessionEvent) {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-	dropped := 0
-	for _, ch := range sm.subscribers[sessionID] {
-		select {
-		case ch <- evt:
-		default:
-			dropped++
-		}
-	}
-	if evt.TaskID != "" {
-		for _, ch := range sm.taskSubscribers[evt.TaskID] {
-			select {
-			case ch <- evt:
-			default:
-				dropped++
-			}
-		}
-	}
-	if dropped > 0 {
-		log.Printf("[broadcast] session=%s type=%s 丢弃事件 %d 条（订阅者通道已满）", sessionID, evt.Type, dropped)
-	}
-}
-
 func (sm *SessionManager) ListTaskMessages(taskID string) ([]models.ChatMessage, error) {
 	return sm.store.LoadTaskMessages(taskID)
+}
+
+func (sm *SessionManager) ClearTaskMessages(taskID string) error {
+	return sm.store.ClearTaskMessages(taskID)
 }
 
 func (sm *SessionManager) appendTaskMessage(taskID, sessionID, role, text string, draftVersion int) {
@@ -1173,6 +1515,11 @@ func (sm *SessionManager) DeleteTask(taskID string) error {
 	return sm.store.DeleteTask(taskID)
 }
 
+func (sm *SessionManager) CreateTaskDirect(req models.CreateTaskRequest) error {
+	_, _, err := sm.store.GetOrCreateTask(req.TaskID, req.Topic, req.UID, "", req.Platform, req.SkillID, req.Model, req.AccountID, req.NovelName)
+	return err
+}
+
 func (sm *SessionManager) inferChapterNumber(taskID string) int {
 	task, err := sm.store.GetTask(taskID)
 	if err != nil {
@@ -1186,11 +1533,4 @@ func (sm *SessionManager) inferChapterNumber(taskID string) int {
 		return len(sessions)
 	}
 	return 1
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

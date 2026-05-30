@@ -3,9 +3,8 @@ package runner
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
-	"log"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,12 +23,6 @@ type OpenCodeRunner struct {
 	runningSID map[string]bool
 }
 
-type RunResult struct {
-	SessionID string
-	Events    []models.SessionEvent
-	ExitCode  int
-}
-
 type streamWriter struct {
 	events chan<- models.SessionEvent
 	mu     sync.Mutex
@@ -42,10 +35,7 @@ func (w *streamWriter) send(evt models.SessionEvent) {
 	if w.closed {
 		return
 	}
-	select {
-	case w.events <- evt:
-	default:
-	}
+	w.events <- evt
 }
 
 func (w *streamWriter) close() {
@@ -61,8 +51,19 @@ func NewOpenCodeRunner(binaryPath string) *OpenCodeRunner {
 	}
 }
 
+type RunOptions struct {
+	CWD              string
+	Model            string
+	SessionID        string
+	Message          string
+	Timeout          time.Duration
+	ConfigPath       string
+	DeepseekAPIKey   string
+	WriteDraftOnText bool
+}
+
 func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan models.SessionEvent, error) {
-	events := make(chan models.SessionEvent, 100)
+	events := make(chan models.SessionEvent, 50)
 	w := &streamWriter{events: events}
 
 	go func() {
@@ -75,11 +76,17 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 		}
 
 		startTime := time.Now()
+		capturedSID := opts.SessionID
 
-		var textBuf strings.Builder
-		hasWrite := false
-
-		args := r.buildArgs(opts)
+		args := []string{
+			"run",
+			"--thinking",
+			"--model", opts.Model,
+		}
+		if opts.SessionID != "" {
+			args = append(args, "--session", opts.SessionID)
+		}
+		args = append(args, opts.Message)
 
 		cmd := exec.CommandContext(ctx, r.binaryPath, args...)
 		cmd.Dir = opts.CWD
@@ -90,286 +97,187 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 			}
 		}()
 
+		cmd.Env = cleanEnv(os.Environ())
 		if opts.ConfigPath != "" {
-			cmd.Env = append(os.Environ(), "OPENCODE_CONFIG="+opts.ConfigPath)
+			cmd.Env = append(cmd.Env, "OPENCODE_CONFIG="+opts.ConfigPath)
 		}
 		if opts.DeepseekAPIKey != "" {
-			cmd.Env = append(cmd.Env, "DEEPSEEK_API_KEY="+opts.DeepseekAPIKey)
+			cmd.Env = append(cmd.Env, "TEAM_DEEPSEEK_API_KEY="+opts.DeepseekAPIKey)
+		}
+
+		logger.Info("opencode launch: cwd=%s model=%s session_id=%s msg_len=%d config_path=%s deepseek_key_set=%v binary=%s",
+			opts.CWD, opts.Model, opts.SessionID, len(opts.Message), opts.ConfigPath, opts.DeepseekAPIKey != "", r.binaryPath)
+		msgPreview := opts.Message
+		if len(msgPreview) > 300 {
+			msgPreview = msgPreview[:300] + "..."
+		}
+		logger.Info("opencode message: %s", msgPreview)
+		if entries, err := os.ReadDir(opts.CWD); err == nil {
+			names := make([]string, 0, len(entries))
+			for _, e := range entries {
+				names = append(names, e.Name())
+			}
+			logger.Info("opencode cwd listing (%d entries): %v", len(names), names)
+		} else {
+			logger.Warn(logging.WarnProcessStuck, "opencode cwd read error: %v", err)
 		}
 
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
-			w.send(models.SessionEvent{
-				Type:  "error",
-				Error: fmt.Sprintf("failed to get stdout: %v", err),
-			})
+			w.send(models.SessionEvent{Type: "error", Error: fmt.Sprintf("stdout pipe: %v", err)})
 			return
 		}
-
-		stderr, err := cmd.StderrPipe()
+		stderrPipe, err := cmd.StderrPipe()
 		if err != nil {
-			w.send(models.SessionEvent{
-				Type:  "error",
-				Error: fmt.Sprintf("failed to get stderr: %v", err),
-			})
+			w.send(models.SessionEvent{Type: "error", Error: fmt.Sprintf("stderr pipe: %v", err)})
 			return
 		}
 
 		if err := cmd.Start(); err != nil {
 			logger.Error(logging.ErrSessionError, "opencode start failed: cwd=%s model=%s err=%v", opts.CWD, opts.Model, err)
-			w.send(models.SessionEvent{
-				Type:  "error",
-				Error: fmt.Sprintf("failed to start opencode: %v", err),
-			})
+			w.send(models.SessionEvent{Type: "error", Error: fmt.Sprintf("start failed: %v", err)})
 			return
 		}
 
-		logger.Info("opencode process started: pid=%d cwd=%s model=%s", cmd.Process.Pid, opts.CWD, opts.Model)
+		logger.Info("opencode started: pid=%d cwd=%s model=%s", cmd.Process.Pid, opts.CWD, opts.Model)
+		w.send(models.SessionEvent{Type: "step_start", SessionID: capturedSID})
 
+		draftPath := filepath.Join(opts.CWD, "current_draft.md")
+		var lastDraftMod time.Time
+		var lastDraftSize int64
+		if st, err := os.Stat(draftPath); err == nil {
+			lastDraftMod = st.ModTime()
+			lastDraftSize = st.Size()
+		}
+
+		draftStop := make(chan struct{})
 		go func() {
-			sc := bufio.NewScanner(stderr)
-			for sc.Scan() {
-				log.Printf("[opencode stderr] %s", sc.Text())
+			ticker := time.NewTicker(3 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-draftStop:
+					return
+				case <-ticker.C:
+					st, err := os.Stat(draftPath)
+					if err != nil {
+						continue
+					}
+					if st.ModTime().After(lastDraftMod) || st.Size() != lastDraftSize {
+						lastDraftMod = st.ModTime()
+						lastDraftSize = st.Size()
+						w.send(models.SessionEvent{
+							Type:      "draft_updated",
+							SessionID: capturedSID,
+						})
+					}
+				}
 			}
 		}()
 
-		seq := 0
-		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 1024*1024), 16*1024*1024)
+		stdoutDone := make(chan struct{})
+		stderrDone := make(chan struct{})
+		stdoutLineCount := 0
+		var stderrData []byte
 
-		capturedSID := opts.SessionID
-
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" {
-				continue
+		go func() {
+			defer close(stdoutDone)
+			scanner := bufio.NewScanner(stdout)
+			scanner.Buffer(make([]byte, 1024*1024), 16*1024*1024)
+			for scanner.Scan() {
+				stdoutLineCount++
+				line := scanner.Text()
+				if stdoutLineCount <= 20 {
+					truncated := line
+					if len(truncated) > 500 {
+						truncated = truncated[:500] + "...(truncated)"
+					}
+					logger.Info("opencode stdout[%d]: %s", stdoutLineCount, truncated)
+				}
 			}
-
-			evt, err := parseOpenCodeEvent(line, capturedSID)
-			if err != nil {
-				log.Printf("[opencode parse] failed to parse line (len=%d, SID=%s): %v", len(line), capturedSID, err)
-				continue
+			if err := scanner.Err(); err != nil {
+				logger.Warn(logging.WarnProcessStuck, "opencode stdout scanner error: %v", err)
 			}
+			logger.Info("opencode stdout done: total_lines=%d", stdoutLineCount)
+		}()
 
-			if evt.Type == "token" && evt.Text != "" {
-				textBuf.WriteString(evt.Text)
-			}
-			if evt.Type == "tool_call" && isWriteTool(evt.Tool) {
-				hasWrite = true
-			}
-
-			if capturedSID == "" && evt.SessionID != "" {
-				capturedSID = evt.SessionID
-				evt.SessionID = capturedSID
-			} else if capturedSID != "" && evt.SessionID == "" {
-				evt.SessionID = capturedSID
-			}
-
-			evt.Seq = seq
-			seq++
-			w.send(evt)
-		}
-
-		if err := scanner.Err(); err != nil {
-			log.Printf("[opencode stdout] scanner error (SID=%s): %v", capturedSID, err)
-		}
-
-	if err := cmd.Wait(); err != nil {
-		duration := time.Since(startTime)
-		if ctx.Err() != nil {
-			logger.Warn(logging.WarnSlowResponse, "opencode timeout/cancelled: pid=%d duration=%s", cmd.Process.Pid, duration)
-			w.send(models.SessionEvent{
-					Type:      "error",
-					SessionID: capturedSID,
-					Error:     "process timeout or cancelled",
-				})
+		go func() {
+			defer close(stderrDone)
+			data, _ := io.ReadAll(stderrPipe)
+			stderrData = data
+			if len(data) > 0 {
+				stderrStr := string(data)
+				if len(stderrStr) > 2000 {
+					stderrStr = stderrStr[:2000] + "...(truncated)"
+				}
+				logger.Info("opencode stderr (%d bytes): %s", len(data), strings.TrimSpace(stderrStr))
 			} else {
-				w.send(models.SessionEvent{
-					Type:      "error",
-					SessionID: capturedSID,
-					Error:     fmt.Sprintf("opencode exited: %v", err),
-				})
-		}
-	}
+				logger.Info("opencode stderr: (empty)")
+			}
+		}()
 
-	duration := time.Since(startTime)
-	logger.Info("opencode process exited: pid=%d duration=%s lines=%d has_write=%v",
-		cmd.Process.Pid, duration, seq, hasWrite)
-
-	if !hasWrite && textBuf.Len() > 0 {
-			draftPath := filepath.Join(opts.CWD, "current_draft.md")
-			if err := os.WriteFile(draftPath, []byte(textBuf.String()), 0644); err == nil {
-				w.send(models.SessionEvent{
-					Type:      "draft_updated",
-					SessionID: capturedSID,
-				})
+		hadError := false
+		exitCode := 0
+		if err := cmd.Wait(); err != nil {
+			hadError = true
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				exitCode = exitErr.ExitCode()
+			} else {
+				exitCode = -1
+			}
+			if ctx.Err() != nil {
+				logger.Warn(logging.WarnSlowResponse, "opencode timeout/cancelled: pid=%d duration=%s", cmd.Process.Pid, time.Since(startTime))
+				w.send(models.SessionEvent{Type: "error", SessionID: capturedSID, Error: "process timeout or cancelled"})
+			} else {
+				logger.Error(logging.ErrSessionError, "opencode exited with error: pid=%d exit_code=%d err=%v", cmd.Process.Pid, exitCode, err)
+				w.send(models.SessionEvent{Type: "error", SessionID: capturedSID, Error: fmt.Sprintf("opencode exited: %v", err)})
 			}
 		}
+		close(draftStop)
 
-		w.send(models.SessionEvent{
-			Type:      "done",
-			SessionID: capturedSID,
-		})
+		<-stdoutDone
+		<-stderrDone
+
+		duration := time.Since(startTime)
+		draftSize := int64(0)
+		if st, err := os.Stat(draftPath); err == nil {
+			draftSize = st.Size()
+		}
+		logger.Info("opencode done: pid=%d duration=%s draft_size=%d had_error=%v exit_code=%d stdout_lines=%d stderr_bytes=%d",
+			cmd.Process.Pid, duration, draftSize, hadError, exitCode, stdoutLineCount, len(stderrData))
+
+		if !hadError && draftSize > 0 {
+			w.send(models.SessionEvent{
+				Type:      "draft_updated",
+				SessionID: capturedSID,
+			})
+		}
+
+		if !hadError {
+			w.send(models.SessionEvent{
+				Type:      "done",
+				SessionID: capturedSID,
+			})
+		}
 	}()
 
 	return events, nil
 }
 
-type RunOptions struct {
-	CWD            string
-	Model          string
-	SessionID      string
-	Message        string
-	Timeout        time.Duration
-	ConfigPath     string
-	DeepseekAPIKey string
+func cleanEnv(env []string) []string {
+	var filtered []string
+	for _, e := range env {
+		if strings.HasPrefix(e, "OPENCODE=") ||
+			strings.HasPrefix(e, "OPENCODE_PROCESS_ROLE=") ||
+			strings.HasPrefix(e, "OPENCODE_PID=") ||
+			strings.HasPrefix(e, "OPENCODE_RUN_ID=") ||
+			strings.HasPrefix(e, "TEAM_DEEPSEEK_API_KEY=") ||
+			strings.HasPrefix(e, "DEEPSEEK_API_KEY=") ||
+			strings.HasPrefix(e, "HY3_API_KEY=") ||
+			strings.HasPrefix(e, "TEAM_HY3_API_KEY=") {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	return filtered
 }
-
-func (r *OpenCodeRunner) buildArgs(opts RunOptions) []string {
-	args := []string{
-		"run",
-		"--format", "json",
-		"--model", opts.Model,
-		"--dir", opts.CWD,
-	}
-
-	if opts.SessionID != "" {
-		args = append(args, "--session", opts.SessionID)
-	}
-
-	args = append(args, opts.Message)
-	return args
-}
-
-type rawEvent struct {
-	Type      string `json:"type"`
-	Timestamp int64  `json:"timestamp"`
-	SessionID string `json:"sessionID"`
-	Part      struct {
-		ID        string `json:"id"`
-		MessageID string `json:"messageID"`
-		SessionID string `json:"sessionID"`
-		Type      string `json:"type"`
-		Text      string `json:"text"`
-		Tool      string `json:"tool"`
-		CallID    string `json:"callID"`
-		Reason    string `json:"reason"`
-		State     struct {
-			Status string          `json:"status"`
-			Input  json.RawMessage `json:"input"`
-			Output string          `json:"output"`
-		} `json:"state"`
-		Tokens struct {
-			Total     int `json:"total"`
-			Input     int `json:"input"`
-			Output    int `json:"output"`
-			Reasoning int `json:"reasoning"`
-		} `json:"tokens"`
-	} `json:"part"`
-}
-
-func isWriteTool(tool string) bool {
-	lower := strings.ToLower(tool)
-	return lower == "write" || lower == "write_file" || lower == "write_to_file" ||
-		lower == "filewrite" || lower == "edit"
-}
-
-func extractDraftPath(input json.RawMessage) string {
-	var m map[string]interface{}
-	if err := json.Unmarshal(input, &m); err == nil {
-		if fp := pickPath(m); fp != "" {
-			return fp
-		}
-	} else {
-		var s string
-		if err := json.Unmarshal(input, &s); err == nil {
-			var m2 map[string]interface{}
-			if err := json.Unmarshal([]byte(s), &m2); err == nil {
-				if fp := pickPath(m2); fp != "" {
-					return fp
-				}
-			}
-		}
-	}
-	return ""
-}
-
-func pickPath(m map[string]interface{}) string {
-	for _, key := range []string{"filePath", "file_path", "path", "outputPath", "output_path"} {
-		if v, ok := m[key]; ok {
-			if s, ok := v.(string); ok && s != "" {
-				return s
-			}
-		}
-	}
-	return ""
-}
-
-func parseOpenCodeEvent(line string, fallbackSID string) (models.SessionEvent, error) {
-	var raw rawEvent
-	if err := json.Unmarshal([]byte(line), &raw); err != nil {
-		return models.SessionEvent{}, err
-	}
-
-	sid := raw.SessionID
-	if sid == "" {
-		sid = raw.Part.SessionID
-	}
-	if sid == "" {
-		sid = fallbackSID
-	}
-
-	switch raw.Type {
-	case "step_start":
-		return models.SessionEvent{
-			Type:      "step_start",
-			SessionID: sid,
-		}, nil
-
-	case "text":
-		return models.SessionEvent{
-			Type:      "token",
-			SessionID: sid,
-			Text:      raw.Part.Text,
-		}, nil
-
-	case "tool_use":
-		evt := models.SessionEvent{
-			Type:      "tool_call",
-			SessionID: sid,
-			Tool:      raw.Part.Tool,
-			ToolArgs:  raw.Part.State.Input,
-		}
-		if raw.Part.State.Output != "" {
-			evt.ToolResult = raw.Part.State.Output
-		}
-		if isWriteTool(raw.Part.Tool) && len(raw.Part.State.Input) > 0 {
-			evt.DraftPath = extractDraftPath(raw.Part.State.Input)
-		}
-		return evt, nil
-
-	case "step_finish":
-		evt := models.SessionEvent{
-			Type:      "step_finish",
-			SessionID: sid,
-			Reason:    raw.Part.Reason,
-		}
-		if raw.Part.Tokens.Total > 0 {
-			evt.Tokens = &models.TokenInfo{
-				Total:     raw.Part.Tokens.Total,
-				Input:     raw.Part.Tokens.Input,
-				Output:    raw.Part.Tokens.Output,
-				Reasoning: raw.Part.Tokens.Reasoning,
-			}
-		}
-		return evt, nil
-
-	default:
-		return models.SessionEvent{
-			Type:      raw.Type,
-			SessionID: sid,
-		}, nil
-	}
-}
-
-

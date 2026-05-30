@@ -18,6 +18,7 @@ type SkillDef struct {
 	TargetPlatforms  []string
 	StyleRules       []string
 	Constraints      []string
+	RawContent       string
 }
 
 var PrebuiltSkills = map[string]SkillDef{
@@ -230,7 +231,13 @@ func WriteSkillFile(skillsDir, skillName string, skill SkillDef) (string, error)
 		return "", fmt.Errorf("create skill dir: %w", err)
 	}
 
-	content := RenderSkillMD(skill)
+	var content string
+	if skill.RawContent != "" {
+		content = skill.RawContent
+	} else {
+		content = RenderSkillMD(skill)
+	}
+
 	path := filepath.Join(dir, "SKILL.md")
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		return "", fmt.Errorf("write SKILL.md: %w", err)
@@ -239,119 +246,29 @@ func WriteSkillFile(skillsDir, skillName string, skill SkillDef) (string, error)
 	return path, nil
 }
 
-func BuildInitialMessage(topic string, skill SkillDef) string {
+func BuildStartMessage(novelName string, skill SkillDef, userText string, chapterNumber int) string {
 	var sb strings.Builder
 
-	sb.WriteString("# 角色定位\n\n")
-	sb.WriteString("你是一个专业的内容创作助手。请严格按照以下规则完成任务。\n\n")
+	sb.WriteString("# 小说创作任务\n\n")
+	sb.WriteString("你是一个专业的小说创作助手。请先使用 skill 工具加载创作风格规则，\n")
+	sb.WriteString("严格按照其中的风格规则、输出约束和写作要求进行创作。\n\n")
 
-	sb.WriteString("## 任务主题\n\n")
-	sb.WriteString(fmt.Sprintf("%s\n\n", topic))
-
-	if skill.ID == "my-novel-writer" {
-		sb.WriteString("## 小说创作框架\n\n")
-		sb.WriteString("在开始写作之前，请先在 decisions.md 中建立以下框架：\n\n")
-		sb.WriteString("1. **人物设定**：根据用户输入的主题和角色信息，列出主要人物（姓名、身份、性格、动机），不少于2个角色\n")
-		sb.WriteString("2. **世界观设定**：根据用户输入的主题，构建故事发生的世界背景（时代、规则、势力等）\n")
-		sb.WriteString("3. **章节大纲**：为本次创作规划3-5章的简易大纲（每章一句话梗概即可），写入 decisions.md\n\n")
-		sb.WriteString("完成框架后，根据大纲生成第1章正文。\n")
-		sb.WriteString("正文开头不允许出现章节标题（如'第1章 XXX'），章节标题应单独填写在 JSON 的 chapter_title 字段中。\n\n")
-	}
-
-	sb.WriteString("## 风格要求\n\n")
-	for i, rule := range skill.StyleRules {
-		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, rule))
-	}
-	sb.WriteString("\n")
-
-	sb.WriteString("## 输出约束\n\n")
-	for i, c := range skill.Constraints {
-		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, c))
-	}
-	sb.WriteString("\n")
-
-	sb.WriteString("## 硬性约束（最重要！）\n\n")
-	sb.WriteString("1. 回复完成后，你必须使用 write 工具将完整内容写入 current_draft.md 文件。这是必须执行的步骤！\n")
-	sb.WriteString("2. 章节标题作为 Markdown 一级标题（如 '# 第1章 重回少年时'）写在 current_draft.md 最开头\n\n")
-
-	sb.WriteString("## 输出格式\n\n")
-	sb.WriteString("请先直接输出文案正文，然后再使用 write 工具保存到 current_draft.md。\n\n")
-	sb.WriteString("现在请开始创作：")
-
-	return sb.String()
-}
-
-func BuildWakeMessage(topic string, skill SkillDef, userText string, hasShortTerm, hasMediumTerm bool, chapterNumber int) string {
-	var sb strings.Builder
-
-	sb.WriteString("# ⚠️ 续写任务 — 禁止重新开始\n\n")
-	sb.WriteString("这是对已有小说的续写操作，不是新建任务。你必须基于前文内容继续推进剧情。\n\n")
-	sb.WriteString("## 红线禁令（违反将导致内容作废）\n\n")
-	sb.WriteString("1. **禁止创建全新故事**：不得另起炉灶，不得更换世界观或故事背景\n")
-	sb.WriteString("2. **禁止更换主角**：已有主角的姓名、身份、性格必须与前文完全一致\n")
-	sb.WriteString(fmt.Sprintf("3. **本次续写章节编号**：第 %d 章（不得使用其他编号）\n", chapterNumber))
-	sb.WriteString("4. **禁止忽略前文**：必须先使用 read 工具完整阅读 RECENT_DRAFTS.md\n\n")
-	sb.WriteString(fmt.Sprintf("你正在继续处理任务：%s\n\n", topic))
-
-	if hasShortTerm && hasMediumTerm {
-		sb.WriteString("## 历史上下文\n\n")
-		sb.WriteString("工作目录下有两个历史上下文文件，请仔细阅读后基于它们继续创作：\n\n")
-		sb.WriteString("- **RECENT_DRAFTS.md**：近期稿子的完整内容（短期记忆）\n")
-		sb.WriteString("- **HISTORY_SUMMARY.md**：历史摘要（中期记忆）\n\n")
-	} else if hasShortTerm {
-		sb.WriteString("## 历史上下文\n\n")
-		sb.WriteString("工作目录下有近期稿子文件 **RECENT_DRAFTS.md**，请仔细阅读后基于它继续创作。\n\n")
-	} else if hasMediumTerm {
-		sb.WriteString("## 历史上下文\n\n")
-		sb.WriteString("工作目录下有历史摘要文件 **HISTORY_SUMMARY.md**，请仔细阅读后基于它继续创作。\n\n")
-	}
-
-	if skill.ID == "my-novel-writer" {
-		sb.WriteString("## 分章续写指引\n\n")
-		sb.WriteString("1. 先读取 RECENT_DRAFTS.md 和 HISTORY_SUMMARY.md，确认上一章的剧情终点和人物状态\n")
-		sb.WriteString("2. 读取 decisions.md（如果存在），确认之前设定的人物、世界观和大纲\n")
-		sb.WriteString("3. 根据大纲判断当前应写第几章，从上一次结束的地方无缝衔接继续\n")
-		sb.WriteString("4. 续写新章节时，保持人物性格一致、世界观自洽、伏笔逐步回收\n")
-		sb.WriteString("5. 正文开头不允许出现章节标题（如'第X章 XXX'），章节标题应单独填写在 JSON 的 chapter_title 字段中\n\n")
-	}
-
-	if skill.ID == "general_fallback_v1" {
-		sb.WriteString("## 续写操作步骤（必须严格执行）\n\n")
-		sb.WriteString("1. **第一步：阅读前文**。使用 read 工具读取 RECENT_DRAFTS.md 完整内容，不能跳过\n")
-		sb.WriteString("2. **第二步：提取前文信息**——\n")
-		sb.WriteString("   - 所有已出现人物的姓名、身份、性格和人物关系（禁止修改任何一个）\n")
-		sb.WriteString("   - 上一章结尾的剧情状态、未解决的冲突、已铺设的伏笔\n")
-		sb.WriteString("   - 前文的写作风格、用词习惯、叙事节奏\n")
-		sb.WriteString(fmt.Sprintf("3. **第三步：生成第 %d 章**。根据本章核心内容，生成一个 4-15 字的章节标题，格式 '# 第%d章 章节名称'\n", chapterNumber, chapterNumber))
-		sb.WriteString("4. **第四步：无缝续写**。从上一章结尾处直接衔接，承接冲突和伏笔，推进剧情\n")
-		sb.WriteString("5. 章节标题写在 current_draft.md 最开头，标题后紧跟正文\n")
-		sb.WriteString("6. 人物名称、性格、关系必须与 RECENT_DRAFTS.md 完全一致，不得修改或替换\n\n")
-	}
+	sb.WriteString("## 任务信息\n\n")
+	sb.WriteString(fmt.Sprintf("- 书名：%s\n", novelName))
+	sb.WriteString(fmt.Sprintf("- 本次创作章节：第 %d 章\n", chapterNumber))
+	sb.WriteString("- 章节标题请你根据风格规则和本章内容自行拟定\n\n")
 
 	if userText != "" {
 		sb.WriteString("## 用户指令\n\n")
 		sb.WriteString(fmt.Sprintf("%s\n\n", userText))
 	}
 
-	sb.WriteString("## 风格要求\n\n")
-	for i, rule := range skill.StyleRules {
-		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, rule))
-	}
-	sb.WriteString("\n")
-
-	sb.WriteString("## 输出约束\n\n")
-	for i, c := range skill.Constraints {
-		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, c))
-	}
-	sb.WriteString("\n")
-
 	sb.WriteString("## 硬性约束（最重要！）\n\n")
-	sb.WriteString("1. 回复完成后，你必须使用 write 工具将完整内容写入 current_draft.md 文件。\n")
-	sb.WriteString("2. 文件路径使用绝对路径或相对于工作目录的路径 current_draft.md\n\n")
+	sb.WriteString("1. 回复完成后，你必须使用 write 工具将完整内容写入 current_draft.md 文件\n")
+	sb.WriteString("2. 章节标题使用 Markdown 一级标题写在 current_draft.md 最开头\n")
+	sb.WriteString("3. 正文开头不允许出现章节标题（如'第X章 XXX'）\n\n")
 
-	sb.WriteString("## 输出格式\n\n")
-	sb.WriteString("请先直接输出文案正文，然后再使用 write 工具保存到 current_draft.md。\n\n")
-	sb.WriteString("现在请开始继续创作：")
+	sb.WriteString("现在请开始创作：")
 
 	return sb.String()
 }
