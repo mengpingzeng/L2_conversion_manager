@@ -328,6 +328,7 @@ func (s *Server) handleTaskSessions(w http.ResponseWriter, r *http.Request) {
 	if sessions == nil {
 		sessions = []*models.Session{}
 	}
+	s.sm.FillSessionsDraftSize(sessions)
 	if logger != nil {
 		logger.Info("sessions listed: task=%s count=%d", taskID, len(sessions))
 	}
@@ -624,6 +625,7 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	if sessions == nil {
 		sessions = []*models.Session{}
 	}
+	s.sm.FillSessionsDraftSize(sessions)
 	writeJSON(w, 200, map[string]interface{}{
 		"sessions": stripSessionListDecisions(sessions),
 		"count":    len(sessions),

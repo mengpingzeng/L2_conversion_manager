@@ -11,6 +11,7 @@ const (
 	StatusWarm       SessionStatus = "WARM"
 	StatusCold       SessionStatus = "COLD"
 	StatusArchived   SessionStatus = "ARCHIVED"
+	StatusNoContent  SessionStatus = "NO_CONTENT"
 )
 
 const (
@@ -53,6 +54,7 @@ type Session struct {
 	MessageCount  int           `json:"message_count"`
 	TotalTokens   int           `json:"total_tokens"`
 	DraftVersion  int           `json:"draft_version"`
+	DraftSize     int64         `json:"draft_size,omitempty"`
 	NovelName     string        `json:"novel_name,omitempty"`
 	VolumeName    string        `json:"volume_name,omitempty"`
 	ChapterNumber int           `json:"chapter_number"`

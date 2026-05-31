@@ -403,16 +403,25 @@ func (sm *SessionManager) injectTaskContext(cwd, taskID string) {
 	shortData, errShort := sm.store.ReadShortTerm(taskID)
 	medData, errMed := sm.store.ReadMediumTerm(taskID)
 
-	if errShort != nil || len(shortData) == 0 {
-		sessions, err := sm.store.LoadTaskSessions(taskID)
-		if err == nil && len(sessions) > 0 {
-			var validSessions []*models.Session
-			for _, s := range sessions {
-				if s.Status != models.StatusCreated && s.Status != models.StatusGenerating && s.ChapterNumber > 0 {
+		if errShort != nil || len(shortData) == 0 {
+			sessions, err := sm.store.LoadTaskSessions(taskID)
+			if err == nil && len(sessions) > 0 {
+				var validSessions []*models.Session
+				for _, s := range sessions {
+					if s.ChapterNumber <= 0 {
+						continue
+					}
+					if s.Status == models.StatusCreated || s.Status == models.StatusGenerating {
+						continue
+					}
+					sessCwd := sm.store.GetSessionCWDDir(taskID, s.SessionID)
+					draftPath := filepath.Join(sessCwd, "current_draft.md")
+					if info, statErr := os.Stat(draftPath); statErr != nil || info.Size() == 0 {
+						continue
+					}
 					validSessions = append(validSessions, s)
 				}
-			}
-			if len(validSessions) > 0 {
+				if len(validSessions) > 0 {
 				var content string
 				start := 0
 				if len(validSessions) > models.ShortTermWindowSize {
@@ -497,9 +506,16 @@ func (sm *SessionManager) inferChapterNumberForSession(taskID string, sess *mode
 		if s.SessionID == sess.SessionID {
 			return chapNo
 		}
-		if s.Status != models.StatusCreated && s.Status != models.StatusGenerating && s.ChapterNumber > 0 {
-			chapNo++
+		if s.ChapterNumber <= 0 {
+			continue
 		}
+		if s.Status == models.StatusCreated || s.Status == models.StatusGenerating {
+			continue
+		}
+		if !sm.hasDraftFile(taskID, s.SessionID) {
+			continue
+		}
+		chapNo++
 	}
 	return chapNo
 }
@@ -697,6 +713,7 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 	var assistantText strings.Builder
 	assistantPersisted := false
 	var evtCountStepStart, evtCountToken, evtCountToolCall, evtCountStepFinish, evtCountReasoning, evtCountDraftUpdated, evtCountError, evtCountOther int
+	noContentDetected := false
 	sessionDraftPath := ""
 	var draftBaselineMod time.Time
 	var draftBaselineSize int64
@@ -786,10 +803,6 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 			}
 		}
 
-		if evt.Type == "reasoning" && evt.Text != "" {
-			textBuf.WriteString(evt.Text)
-		}
-
 		if sessionID != "" && evt.Type == "step_start" && capturedSID != "" {
 			sess, err := sm.store.GetSession(taskID, sessionID)
 			if err == nil && sess.OpenCodeSID == "" {
@@ -847,6 +860,7 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 				}
 			}
 			if !draftExists {
+				noContentDetected = true
 				logger.Warn(logging.WarnProcessStuck, "opencode returned no content: session=%s task=%s model=%s text_buf_len=%d total_tokens=%d msg_count=%d events(step_start=%d token=%d tool_call=%d step_finish=%d reasoning=%d draft_updated=%d error=%d other=%d)",
 					sessionID, taskID, model, textBuf.Len(), totalTokens, msgCount,
 					evtCountStepStart, evtCountToken, evtCountToolCall, evtCountStepFinish, evtCountReasoning, evtCountDraftUpdated, evtCountError, evtCountOther)
@@ -913,12 +927,18 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 			sess.MessageCount += msgCount
 			sess.TotalTokens += totalTokens
 			sess.LastActiveAt = time.Now()
-			sess.Status = models.StatusWarm
-			if sess.DraftVersion == 0 {
-				sess.DraftVersion = sess.ChapterNumber
+			if noContentDetected {
+				sess.Status = models.StatusNoContent
+				logger.Info("status changed: -> NO_CONTENT: session=%s msg_count=%d total_tokens=%d draft_version=%d",
+					sessionID, sess.MessageCount, sess.TotalTokens, sess.DraftVersion)
+			} else {
+				sess.Status = models.StatusWarm
+				if sess.DraftVersion == 0 {
+					sess.DraftVersion = sess.ChapterNumber
+				}
+				logger.Info("status changed: -> WARM: session=%s msg_count=%d total_tokens=%d draft_version=%d",
+					sessionID, sess.MessageCount, sess.TotalTokens, sess.DraftVersion)
 			}
-			logger.Info("status changed: -> WARM: session=%s msg_count=%d total_tokens=%d draft_version=%d",
-				sessionID, sess.MessageCount, sess.TotalTokens, sess.DraftVersion)
 		}
 		if capturedSID != "" && sess.OpenCodeSID == "" {
 			sess.OpenCodeSID = capturedSID
@@ -1046,11 +1066,21 @@ func (sm *SessionManager) Close(ctx context.Context, sessionID string) error {
 		return nil
 	}
 
+	cwd := sm.store.GetSessionCWDDir(taskID, sessionID)
+	currentDraft := filepath.Join(cwd, "current_draft.md")
+	draftStat, draftErr := os.Stat(currentDraft)
+	if draftErr != nil || draftStat.Size() == 0 {
+		if sess.Status != models.StatusNoContent {
+			sess.Status = models.StatusNoContent
+			_ = sm.store.UpsertSessionInTask(sess)
+			log.Printf("Close: session %s has no draft file, marking NO_CONTENT", sessionID)
+		}
+		return nil
+	}
+
 	episodeID := uuid.New().String()[:8]
 	epochNo := len(sess.Episodes) + 1
 
-	cwd := sm.store.GetSessionCWDDir(taskID, sessionID)
-	currentDraft := filepath.Join(cwd, "current_draft.md")
 	var summaryContent string
 	var draftData []byte
 	if data, err := os.ReadFile(currentDraft); err == nil {
@@ -1312,7 +1342,10 @@ func (sm *SessionManager) WakeTask(ctx context.Context, taskID string, req model
 		}
 	}
 
-	chapterNum := task.SessionCount
+	chapterNum := req.ChapterNumber
+	if chapterNum <= 0 {
+		chapterNum = task.SessionCount
+	}
 
 	var msg string
 	if req.IsFinale {
@@ -1336,6 +1369,25 @@ func (sm *SessionManager) ListSessions(taskID string) ([]*models.Session, error)
 
 func (sm *SessionManager) ListAllSessions() []*models.Session {
 	return sm.store.ListAllSessions()
+}
+
+func (sm *SessionManager) FillSessionsDraftSize(sessions []*models.Session) {
+	for _, s := range sessions {
+		if s.CWDPath == "" {
+			continue
+		}
+		draftPath := filepath.Join(s.CWDPath, "current_draft.md")
+		if info, err := os.Stat(draftPath); err == nil {
+			s.DraftSize = info.Size()
+		}
+	}
+}
+
+func (sm *SessionManager) hasDraftFile(taskID, sessionID string) bool {
+	cwd := sm.store.GetSessionCWDDir(taskID, sessionID)
+	draftPath := filepath.Join(cwd, "current_draft.md")
+	info, err := os.Stat(draftPath)
+	return err == nil && info.Size() > 0
 }
 
 func (sm *SessionManager) ListTasks() []models.TaskInfo {

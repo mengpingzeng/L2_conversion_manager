@@ -3,6 +3,7 @@ package runner
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -80,6 +81,7 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 
 		args := []string{
 			"run",
+			"--format", "json",
 			"--thinking",
 			"--model", opts.Model,
 		}
@@ -194,6 +196,57 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 					}
 					logger.Info("opencode stdout[%d]: %s", stdoutLineCount, truncated)
 				}
+
+				var raw openCodeRawEvent
+				if err := json.Unmarshal([]byte(line), &raw); err != nil {
+					continue
+				}
+
+				switch raw.Type {
+				case "step_start":
+					w.send(models.SessionEvent{
+						Type:      "step_start",
+						SessionID: capturedSID,
+					})
+
+				case "reasoning":
+					w.send(models.SessionEvent{
+						Type:      "reasoning",
+						SessionID: capturedSID,
+						Text:      raw.Part.Text,
+					})
+
+				case "tool_use":
+					w.send(models.SessionEvent{
+						Type:       "tool_call",
+						SessionID:  capturedSID,
+						Tool:       raw.Part.Tool,
+						ToolResult: raw.Part.State.Output,
+						DraftPath:  extractDraftPath(raw.Part.State.Input),
+					})
+
+				case "text":
+					w.send(models.SessionEvent{
+						Type:      "step_finish",
+						SessionID: capturedSID,
+						Text:      raw.Part.Text,
+					})
+
+				case "step_finish":
+					evt := models.SessionEvent{
+						Type:      "step_finish",
+						SessionID: capturedSID,
+					}
+					if raw.Part.Tokens.Total > 0 {
+						evt.Tokens = &models.TokenInfo{
+							Total:     raw.Part.Tokens.Total,
+							Input:     raw.Part.Tokens.Input,
+							Output:    raw.Part.Tokens.Output,
+							Reasoning: raw.Part.Tokens.Reasoning,
+						}
+					}
+					w.send(evt)
+				}
 			}
 			if err := scanner.Err(); err != nil {
 				logger.Warn(logging.WarnProcessStuck, "opencode stdout scanner error: %v", err)
@@ -264,6 +317,22 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 	return events, nil
 }
 
+func extractDraftPath(input json.RawMessage) string {
+	if len(input) == 0 {
+		return ""
+	}
+	var args struct {
+		FilePath string `json:"filePath"`
+	}
+	if err := json.Unmarshal(input, &args); err != nil {
+		return ""
+	}
+	if args.FilePath != "" && strings.HasSuffix(args.FilePath, "current_draft.md") {
+		return args.FilePath
+	}
+	return ""
+}
+
 func cleanEnv(env []string) []string {
 	var filtered []string
 	for _, e := range env {
@@ -281,3 +350,33 @@ func cleanEnv(env []string) []string {
 	}
 	return filtered
 }
+
+type openCodeRawEvent struct {
+	Type      string          `json:"type"`
+	Timestamp int64           `json:"timestamp"`
+	SessionID string          `json:"sessionID"`
+	Part      openCodeRawPart `json:"part"`
+}
+
+type openCodeRawPart struct {
+	ID        string `json:"id"`
+	MessageID string `json:"messageID"`
+	SessionID string `json:"sessionID"`
+	Type      string `json:"type"`
+	Text      string `json:"text"`
+	Reason    string `json:"reason"`
+	Tool      string `json:"tool"`
+	CallID    string `json:"callID"`
+	State     struct {
+		Status string          `json:"status"`
+		Input  json.RawMessage `json:"input"`
+		Output string          `json:"output"`
+	} `json:"state"`
+	Tokens struct {
+		Total     int `json:"total"`
+		Input     int `json:"input"`
+		Output    int `json:"output"`
+		Reasoning int `json:"reasoning"`
+	} `json:"tokens"`
+}
+
