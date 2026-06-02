@@ -61,6 +61,7 @@ type Session struct {
 	CreatedAt     time.Time     `json:"created_at"`
 	LastActiveAt  time.Time     `json:"last_active_at"`
 	ArchivedAt    *time.Time    `json:"archived_at,omitempty"`
+	PostID        string        `json:"post_id,omitempty"`
 	Episodes      []Episode     `json:"episodes,omitempty"`
 }
 

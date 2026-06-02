@@ -65,7 +65,7 @@ type SessionManager struct {
 	fetchedSkills    map[string]adapter.SkillDef
 	fetchedMu        sync.RWMutex
 
-	taskRunGates    sync.Map // taskID -> *taskRunGate
+	taskRunGates sync.Map // taskID -> *taskRunGate
 
 	stopCh chan struct{}
 }
@@ -191,13 +191,13 @@ func (sm *SessionManager) initOpenCodeConfig() error {
 	}
 
 	existing["permission"] = map[string]interface{}{
-		"edit":               "allow",
-		"bash":               "deny",
-		"write":              "allow",
-		"read":               "allow",
+		"edit":  "allow",
+		"bash":  "deny",
+		"write": "allow",
+		"read":  "allow",
 		"external_directory": map[string]interface{}{
-			skillsDir + "/*": "allow",
-			tasksDir + "/*":  "allow",
+			skillsDir + "/*":  "allow",
+			tasksDir + "/*":   "allow",
 			"/tmp/opencode/*": "allow",
 		},
 		"doom_loop": "allow",
@@ -403,25 +403,25 @@ func (sm *SessionManager) injectTaskContext(cwd, taskID string) {
 	shortData, errShort := sm.store.ReadShortTerm(taskID)
 	medData, errMed := sm.store.ReadMediumTerm(taskID)
 
-		if errShort != nil || len(shortData) == 0 {
-			sessions, err := sm.store.LoadTaskSessions(taskID)
-			if err == nil && len(sessions) > 0 {
-				var validSessions []*models.Session
-				for _, s := range sessions {
-					if s.ChapterNumber <= 0 {
-						continue
-					}
-					if s.Status == models.StatusCreated || s.Status == models.StatusGenerating {
-						continue
-					}
-					sessCwd := sm.store.GetSessionCWDDir(taskID, s.SessionID)
-					draftPath := filepath.Join(sessCwd, "current_draft.md")
-					if info, statErr := os.Stat(draftPath); statErr != nil || info.Size() == 0 {
-						continue
-					}
-					validSessions = append(validSessions, s)
+	if errShort != nil || len(shortData) == 0 {
+		sessions, err := sm.store.LoadTaskSessions(taskID)
+		if err == nil && len(sessions) > 0 {
+			var validSessions []*models.Session
+			for _, s := range sessions {
+				if s.ChapterNumber <= 0 {
+					continue
 				}
-				if len(validSessions) > 0 {
+				if s.Status == models.StatusCreated || s.Status == models.StatusGenerating {
+					continue
+				}
+				sessCwd := sm.store.GetSessionCWDDir(taskID, s.SessionID)
+				draftPath := filepath.Join(sessCwd, "current_draft.md")
+				if info, statErr := os.Stat(draftPath); statErr != nil || info.Size() == 0 {
+					continue
+				}
+				validSessions = append(validSessions, s)
+			}
+			if len(validSessions) > 0 {
 				var content string
 				start := 0
 				if len(validSessions) > models.ShortTermWindowSize {
@@ -676,10 +676,6 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 	}
 
 	timeout := time.Duration(sm.cfg.DefaultTimeoutSec) * time.Second
-	runCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	runCtx = logging.NewContext(runCtx, logger)
 
 	apiKey := sm.cfg.DeepseekAPIKey
 	if apiKey == "" {
@@ -697,21 +693,13 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 		WriteDraftOnText: writeDraftOnText,
 	}
 
-	logger.Info("launching opencode: session=%s model=%s cwd=%s", sessionID, model, cwd)
-	events, err := sm.runner.Run(runCtx, opts)
-	if err != nil {
-		logger.Error(logging.ErrSessionError, "opencode launch failed: session=%s err=%v", sessionID, err)
-		errText := fmt.Sprintf("failed to start opencode: %v", err)
-		sm.appendTaskMessage(taskID, sessionID, "system", errText, 0)
-		return
-	}
-
 	msgCount := 0
 	totalTokens := 0
 	capturedSID := ocSID
 	var textBuf strings.Builder
 	var assistantText strings.Builder
 	assistantPersisted := false
+	draftWrittenByTool := false
 	var evtCountStepStart, evtCountToken, evtCountToolCall, evtCountStepFinish, evtCountReasoning, evtCountDraftUpdated, evtCountError, evtCountOther int
 	noContentDetected := false
 	sessionDraftPath := ""
@@ -769,129 +757,171 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 		}
 	}
 
-	for evt := range events {
-		if capturedSID == "" && evt.SessionID != "" && evt.SessionID != sessionID {
-			capturedSID = evt.SessionID
-		}
+	maxRetries := 5
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		textBuf.Reset()
+		assistantText.Reset()
+		assistantPersisted = false
+		noContentDetected = false
+		draftWrittenByTool = false
+		evtCountStepStart = 0
+		evtCountToken = 0
+		evtCountToolCall = 0
+		evtCountStepFinish = 0
+		evtCountReasoning = 0
+		evtCountDraftUpdated = 0
+		evtCountError = 0
+		evtCountOther = 0
 
-		evt.SessionID = sessionID
-		evt.TaskID = taskID
-
-		switch evt.Type {
-		case "step_start":
-			evtCountStepStart++
-		case "token":
-			evtCountToken++
-		case "tool_call":
-			evtCountToolCall++
-		case "step_finish":
-			evtCountStepFinish++
-		case "reasoning":
-			evtCountReasoning++
-		case "draft_updated":
-			evtCountDraftUpdated++
-		case "error":
-			evtCountError++
-		default:
-			evtCountOther++
-		}
-
-		if evt.Type == "token" || (evt.Type == "step_finish" && strings.TrimSpace(evt.Text) != "") {
-			if evt.Text != "" {
-				textBuf.WriteString(evt.Text)
-				assistantText.WriteString(evt.Text)
+		runCtx, cancel := context.WithTimeout(ctx, timeout)
+		runCtx = logging.NewContext(runCtx, logger)
+		logger.Info("launching opencode: session=%s model=%s cwd=%s attempt=%d/%d", sessionID, model, cwd, attempt+1, maxRetries)
+		events, err := sm.runner.Run(runCtx, opts)
+		if err != nil {
+			cancel()
+			if attempt < maxRetries-1 {
+				logger.Warn(logging.WarnProcessStuck, "opencode launch failed, retrying: attempt=%d/%d session=%s err=%v", attempt+1, maxRetries, sessionID, err)
+				time.Sleep(3 * time.Second)
+				continue
 			}
+			logger.Error(logging.ErrSessionError, "opencode launch failed: session=%s err=%v", sessionID, err)
+			errText := fmt.Sprintf("failed to start opencode: %v", err)
+			sm.appendTaskMessage(taskID, sessionID, "system", errText, 0)
+			return
 		}
 
-		if sessionID != "" && evt.Type == "step_start" && capturedSID != "" {
-			sess, err := sm.store.GetSession(taskID, sessionID)
-			if err == nil && sess.OpenCodeSID == "" {
-				sess.OpenCodeSID = capturedSID
-				_ = sm.store.UpsertSessionInTask(sess)
+		for evt := range events {
+			if capturedSID == "" && evt.SessionID != "" && evt.SessionID != sessionID {
+				capturedSID = evt.SessionID
 			}
-		}
 
-		if evt.Type == "step_finish" && evt.Tokens != nil {
-			totalTokens += evt.Tokens.Total
-		}
+			evt.SessionID = sessionID
+			evt.TaskID = taskID
 
-		if evt.Type == "tool_call" && evt.DraftPath != "" && (evt.ToolResult != "" || isWriteToolName(evt.Tool)) {
-			emitDraftUpdated()
-		}
+			switch evt.Type {
+			case "step_start":
+				evtCountStepStart++
+			case "token":
+				evtCountToken++
+			case "tool_call":
+				evtCountToolCall++
+			case "step_finish":
+				evtCountStepFinish++
+			case "reasoning":
+				evtCountReasoning++
+			case "draft_updated":
+				evtCountDraftUpdated++
+			case "error":
+				evtCountError++
+			default:
+				evtCountOther++
+			}
 
-		if evt.Type == "done" || evt.Type == "step_finish" {
-			if strings.TrimSpace(assistantText.String()) != "" {
-				persistAssistantMessage()
-			} else if sessionDraftPath != "" {
-				if info, err := os.Stat(sessionDraftPath); err == nil && info.Size() > 0 {
-					persistAssistantMessage()
+			if evt.Type == "token" || (evt.Type == "step_finish" && strings.TrimSpace(evt.Text) != "") {
+				if evt.Text != "" {
+					textBuf.WriteString(evt.Text)
+					assistantText.WriteString(evt.Text)
 				}
 			}
-		}
 
-		if writeDraftOnText && (evt.Type == "step_finish" || evt.Type == "done") && textBuf.Len() > 0 {
-			cwd := sm.store.GetSessionCWDDir(taskID, sessionID)
-			draftPath := filepath.Join(cwd, "current_draft.md")
-			newContent := []byte(textBuf.String())
-			write := true
-			if existing, err := os.ReadFile(draftPath); err == nil && len(existing) > len(newContent) {
-				write = false
+			if sessionID != "" && evt.Type == "step_start" && capturedSID != "" {
+				sess, err := sm.store.GetSession(taskID, sessionID)
+				if err == nil && sess.OpenCodeSID == "" {
+					sess.OpenCodeSID = capturedSID
+					_ = sm.store.UpsertSessionInTask(sess)
+				}
 			}
-			if write {
-				if err := os.WriteFile(draftPath, newContent, 0644); err == nil {
-					if draftSess, getErr := sm.store.GetSession(taskID, sessionID); getErr == nil && draftSess.Status == models.StatusGenerating {
-						draftSess.Status = models.StatusDraftReady
-						_ = sm.store.UpsertSessionInTask(draftSess)
-						logger.Info("status changed: GENERATING -> DRAFT_READY: session=%s draft=%d bytes", sessionID, len(newContent))
+
+			if evt.Type == "step_finish" && evt.Tokens != nil {
+				totalTokens += evt.Tokens.Total
+			}
+
+			if evt.Type == "tool_call" && evt.DraftPath != "" && (evt.ToolResult != "" || isWriteToolName(evt.Tool)) {
+				draftWrittenByTool = true
+				emitDraftUpdated()
+			}
+
+			if evt.Type == "done" || evt.Type == "step_finish" {
+				if strings.TrimSpace(assistantText.String()) != "" {
+					persistAssistantMessage()
+				} else if sessionDraftPath != "" {
+					if info, err := os.Stat(sessionDraftPath); err == nil && info.Size() > 0 {
+						persistAssistantMessage()
 					}
 				}
 			}
-		}
 
-		if evt.Type == "done" {
-			emitDraftUpdated()
-		}
-
-		if evt.Type == "done" && !assistantPersisted && strings.TrimSpace(assistantText.String()) == "" {
-			draftExists := false
-			if sessionDraftPath != "" {
-				if info, err := os.Stat(sessionDraftPath); err == nil && info.Size() > 0 {
-					draftExists = true
+			if writeDraftOnText && !draftWrittenByTool && (evt.Type == "step_finish" || evt.Type == "done") && textBuf.Len() > 0 {
+				cwd := sm.store.GetSessionCWDDir(taskID, sessionID)
+				draftPath := filepath.Join(cwd, "current_draft.md")
+				newContent := []byte(textBuf.String())
+				write := true
+				if existing, err := os.ReadFile(draftPath); err == nil && len(existing) > len(newContent) {
+					write = false
+				}
+				if write {
+					if err := os.WriteFile(draftPath, newContent, 0644); err == nil {
+						if draftSess, getErr := sm.store.GetSession(taskID, sessionID); getErr == nil && draftSess.Status == models.StatusGenerating {
+							draftSess.Status = models.StatusDraftReady
+							_ = sm.store.UpsertSessionInTask(draftSess)
+							logger.Info("status changed: GENERATING -> DRAFT_READY: session=%s draft=%d bytes", sessionID, len(newContent))
+						}
+					}
 				}
 			}
-			if !draftExists {
-				noContentDetected = true
-				logger.Warn(logging.WarnProcessStuck, "opencode returned no content: session=%s task=%s model=%s text_buf_len=%d total_tokens=%d msg_count=%d events(step_start=%d token=%d tool_call=%d step_finish=%d reasoning=%d draft_updated=%d error=%d other=%d)",
-					sessionID, taskID, model, textBuf.Len(), totalTokens, msgCount,
-					evtCountStepStart, evtCountToken, evtCountToolCall, evtCountStepFinish, evtCountReasoning, evtCountDraftUpdated, evtCountError, evtCountOther)
-				errMsg := "AI 未返回内容，请重试"
-				evt = models.SessionEvent{
-					Type:      "error",
-					SessionID: sessionID,
-					TaskID:    taskID,
-					Error:     errMsg,
-				}
-			}
-		}
 
-		if evt.Type == "token" || evt.Type == "tool_call" || evt.Type == "step_finish" ||
-			evt.Type == "done" || evt.Type == "error" || evt.Type == "draft_updated" ||
-			evt.Type == "reasoning" {
-			if evt.Type == "error" && evt.Error != "" {
-				sm.appendTaskMessage(taskID, sessionID, "system", evt.Error, 0)
+			if evt.Type == "done" {
+				emitDraftUpdated()
 			}
-			out := evt
-			if out.Type == "token" {
-				if writeDraftOnText {
-					out.Text = ""
-				} else if out.Text != "" {
-					out.Text = chatDisplayTextDelta(assistantText.String(), sessionDraftPath, out.Text)
+
+			if evt.Type == "done" && !assistantPersisted && strings.TrimSpace(assistantText.String()) == "" {
+				draftExists := false
+				if sessionDraftPath != "" {
+					if info, err := os.Stat(sessionDraftPath); err == nil && info.Size() > 0 {
+						draftExists = true
+					}
+				}
+				if !draftExists {
+					noContentDetected = true
+					logger.Warn(logging.WarnProcessStuck, "opencode returned no content: session=%s task=%s model=%s text_buf_len=%d total_tokens=%d msg_count=%d events(step_start=%d token=%d tool_call=%d step_finish=%d reasoning=%d draft_updated=%d error=%d other=%d)",
+						sessionID, taskID, model, textBuf.Len(), totalTokens, msgCount,
+						evtCountStepStart, evtCountToken, evtCountToolCall, evtCountStepFinish, evtCountReasoning, evtCountDraftUpdated, evtCountError, evtCountOther)
 				}
 			}
-			if out.Type == "step_finish" && out.Text != "" {
-				out.Text = ChatDisplayText(out.Text, sessionDraftPath)
+
+			if evt.Type == "token" || evt.Type == "tool_call" || evt.Type == "step_finish" ||
+				evt.Type == "done" || evt.Type == "error" || evt.Type == "draft_updated" ||
+				evt.Type == "reasoning" {
+				if evt.Type == "error" && evt.Error != "" {
+					sm.appendTaskMessage(taskID, sessionID, "system", evt.Error, 0)
+				}
+				out := evt
+				if out.Type == "token" {
+					if writeDraftOnText {
+						out.Text = ""
+					} else if out.Text != "" {
+						out.Text = chatDisplayTextDelta(assistantText.String(), sessionDraftPath, out.Text)
+					}
+				}
+				if out.Type == "step_finish" && out.Text != "" {
+					out.Text = ChatDisplayText(out.Text, sessionDraftPath)
+				}
 			}
 		}
+		cancel()
+
+		msgCount++
+		if !noContentDetected {
+			break
+		}
+		if attempt < maxRetries-1 {
+			logger.Warn(logging.WarnProcessStuck, "retrying session: attempt=%d/%d session=%s", attempt+1, maxRetries, sessionID)
+			time.Sleep(3 * time.Second)
+		}
+	}
+
+	if noContentDetected {
+		sm.appendTaskMessage(taskID, sessionID, "system", "AI 未返回内容，请重试", 0)
 	}
 
 	if sessionID != "" {
@@ -909,7 +939,6 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 		}
 	}
 
-	msgCount++
 	if sessionID != "" {
 		sess, err = sm.store.GetSession(taskID, sessionID)
 	}
@@ -1570,6 +1599,15 @@ func (sm *SessionManager) DeleteTask(taskID string) error {
 func (sm *SessionManager) CreateTaskDirect(req models.CreateTaskRequest) error {
 	_, _, err := sm.store.GetOrCreateTask(req.TaskID, req.Topic, req.UID, "", req.Platform, req.SkillID, req.Model, req.AccountID, req.NovelName)
 	return err
+}
+
+func (sm *SessionManager) SetSessionPostID(sessionID, postID string) error {
+	sess, _, err := sm.findSession(sessionID)
+	if err != nil {
+		return err
+	}
+	sess.PostID = postID
+	return sm.store.UpsertSessionInTask(sess)
 }
 
 func (sm *SessionManager) inferChapterNumber(taskID string) int {

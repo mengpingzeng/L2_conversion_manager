@@ -281,6 +281,8 @@ func (s *Server) handleTaskUpdate(w http.ResponseWriter, r *http.Request) {
 		Title             string `json:"title"`
 		ChapterNumber     int    `json:"chapter_number"`
 		ChapterCountDelta int    `json:"chapter_count_delta"`
+		SessionID         string `json:"session_id"`
+		PostID            string `json:"post_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		if logger != nil {
@@ -288,6 +290,16 @@ func (s *Server) handleTaskUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		writeError(w, 400, "invalid request body: "+err.Error())
 		return
+	}
+
+	if req.SessionID != "" && req.PostID != "" {
+		if err := s.sm.SetSessionPostID(req.SessionID, req.PostID); err != nil {
+			if logger != nil {
+				logger.Error(logging.ErrDatabaseError, "SetSessionPostID(%s) failed: %v", req.SessionID, err)
+			}
+			writeError(w, 500, "failed to set session post_id: "+err.Error())
+			return
+		}
 	}
 
 	if err := s.sm.UpdateTaskFields(taskID, req.NovelName, req.AccountID, req.VolumeName, req.Title, req.ChapterNumber, req.ChapterCountDelta); err != nil {
