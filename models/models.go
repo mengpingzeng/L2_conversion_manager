@@ -55,6 +55,7 @@ type Session struct {
 	TotalTokens   int           `json:"total_tokens"`
 	DraftVersion  int           `json:"draft_version"`
 	DraftSize     int64         `json:"draft_size,omitempty"`
+	ChapterTitle  string        `json:"chapter_title,omitempty"`
 	NovelName     string        `json:"novel_name,omitempty"`
 	VolumeName    string        `json:"volume_name,omitempty"`
 	ChapterNumber int           `json:"chapter_number"`

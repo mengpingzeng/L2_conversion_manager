@@ -557,17 +557,68 @@ func (s *Store) EnsureTaskDirExists(taskID string) error {
 
 var chapterPrefixRe = regexp.MustCompile(`^第[^\s章]+章\s*`)
 
+var trailingPunctRe = regexp.MustCompile(`[，,。、；;：:！!？?…""''""【】（）()《》—\-~～\s]+$`)
+
+// 行内章节标题：「**第15章 归于大海**」「第15章 归于大海」等（无 # 前缀）
+var inlineChapterTitleRe = regexp.MustCompile(
+	`^(?:\*{1,2}\s*)?第\s*[0-9一二三四五六七八九十百千零两\d]+\s*章\s+(.+?)(?:\s*\*{1,2})?\s*$`,
+)
+
+func stripTrailingPunct(runes []rune) string {
+	s := string(runes)
+	s = trailingPunctRe.ReplaceAllString(s, "")
+	return s
+}
+
+func stripMarkdownBoldWrap(s string) string {
+	t := strings.TrimSpace(s)
+	for strings.HasPrefix(t, "**") && strings.HasSuffix(t, "**") && len(t) > 4 {
+		t = strings.TrimSpace(t[2 : len(t)-2])
+	}
+	return t
+}
+
+func titleFromChapterHeadingLine(line string) string {
+	s := stripMarkdownBoldWrap(strings.TrimSpace(line))
+	if s == "" {
+		return ""
+	}
+	if strings.HasPrefix(s, "# ") {
+		s = strings.TrimSpace(strings.TrimPrefix(s, "# "))
+		s = stripMarkdownBoldWrap(s)
+	}
+	if m := inlineChapterTitleRe.FindStringSubmatch(s); len(m) >= 2 {
+		return strings.TrimSpace(m[1])
+	}
+	if chapterPrefixRe.MatchString(s) {
+		title := strings.TrimSpace(chapterPrefixRe.ReplaceAllString(s, ""))
+		if title != "" {
+			return title
+		}
+	}
+	return ""
+}
+
 func ExtractChapterTitle(draft string) string {
-	lines := strings.SplitN(draft, "\n", 20)
+	lines := strings.SplitN(draft, "\n", 30)
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if title := titleFromChapterHeadingLine(trimmed); title != "" {
+			return title
+		}
 		if strings.HasPrefix(trimmed, "# ") {
 			title := strings.TrimPrefix(trimmed, "# ")
+			title = stripMarkdownBoldWrap(title)
 			title = chapterPrefixRe.ReplaceAllString(title, "")
 			title = strings.TrimSpace(title)
 			if title != "" {
 				return title
 			}
+			// 仅有「# 第N章」、下一行已是正文时，不截取正文前缀充当书名
+			continue
 		}
 	}
 	return ""

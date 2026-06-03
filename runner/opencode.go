@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"clawstudios/pkg/logging"
+	"session_manager/chaterr"
 	"session_manager/models"
 )
 
@@ -126,18 +127,18 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
-			w.send(models.SessionEvent{Type: "error", Error: fmt.Sprintf("stdout pipe: %v", err)})
+			w.send(models.SessionEvent{Type: "error", Error: chaterr.UserFacing(fmt.Sprintf("stdout pipe: %v", err))})
 			return
 		}
 		stderrPipe, err := cmd.StderrPipe()
 		if err != nil {
-			w.send(models.SessionEvent{Type: "error", Error: fmt.Sprintf("stderr pipe: %v", err)})
+			w.send(models.SessionEvent{Type: "error", Error: chaterr.UserFacing(fmt.Sprintf("stderr pipe: %v", err))})
 			return
 		}
 
 		if err := cmd.Start(); err != nil {
 			logger.Error(logging.ErrSessionError, "opencode start failed: cwd=%s model=%s err=%v", opts.CWD, opts.Model, err)
-			w.send(models.SessionEvent{Type: "error", Error: fmt.Sprintf("start failed: %v", err)})
+			w.send(models.SessionEvent{Type: "error", Error: chaterr.UserFacing(fmt.Sprintf("start failed: %v", err))})
 			return
 		}
 
@@ -280,10 +281,10 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 			}
 			if ctx.Err() != nil {
 				logger.Warn(logging.WarnSlowResponse, "opencode timeout/cancelled: pid=%d duration=%s", cmd.Process.Pid, time.Since(startTime))
-				w.send(models.SessionEvent{Type: "error", SessionID: capturedSID, Error: "process timeout or cancelled"})
+				w.send(models.SessionEvent{Type: "error", SessionID: capturedSID, Error: chaterr.UserFacing("process timeout or cancelled")})
 			} else {
 				logger.Error(logging.ErrSessionError, "opencode exited with error: pid=%d exit_code=%d err=%v", cmd.Process.Pid, exitCode, err)
-				w.send(models.SessionEvent{Type: "error", SessionID: capturedSID, Error: fmt.Sprintf("opencode exited: %v", err)})
+				w.send(models.SessionEvent{Type: "error", SessionID: capturedSID, Error: chaterr.UserFacing(fmt.Sprintf("opencode exited: %v", err))})
 			}
 		}
 		close(draftStop)

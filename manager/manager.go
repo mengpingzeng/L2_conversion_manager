@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"session_manager/adapter"
+	"session_manager/chaterr"
 	"session_manager/models"
 	"session_manager/pool"
 	"session_manager/runner"
@@ -480,20 +481,42 @@ func (sm *SessionManager) saveChatOpenCodeSession(cwd, sid string) {
 	_ = os.WriteFile(sm.chatOpenCodeSessionPath(cwd), []byte(sid), 0644)
 }
 
-func (sm *SessionManager) resolveChapterNoticeMeta(taskID, sessionID string, sess *models.Session, draftPath string) (int, string) {
+func (sm *SessionManager) resolveChapterNoticeMeta(taskID, sessionID string, sess *models.Session, draftPath string) (chapterNo int, volumeName, chapterTitle string, effectiveDraftPath string) {
+	// 对话模式 runSessionLoop 的 sessionID 为空时，回退到任务当前/最新章节 session
+	if sessionID == "" && taskID != "" {
+		if task, err := sm.store.GetTask(taskID); err == nil {
+			if task.ActiveSessionID != "" {
+				sessionID = task.ActiveSessionID
+			} else if len(task.SessionIDs) > 0 {
+				sessionID = task.SessionIDs[len(task.SessionIDs)-1]
+			}
+		}
+	}
 	if sess == nil && sessionID != "" && taskID != "" {
 		if s, err := sm.store.GetSession(taskID, sessionID); err == nil {
 			sess = s
 		}
 	}
-	chapterNo := 0
+	if draftPath == "" && sessionID != "" && taskID != "" {
+		draftPath = filepath.Join(sm.store.GetSessionCWDDir(taskID, sessionID), "current_draft.md")
+	}
+	chapterNo = 0
 	if sess != nil && sess.ChapterNumber > 0 {
 		chapterNo = sess.ChapterNumber
 	} else if sess != nil && taskID != "" {
 		chapterNo = sm.inferChapterNumberForSession(taskID, sess)
 	}
-	title := parseDraftChapterTitle(draftPath)
-	return chapterNo, title
+	chapterTitle = parseDraftChapterTitle(draftPath)
+	volumeName = ""
+	if sess != nil {
+		volumeName = strings.TrimSpace(sess.VolumeName)
+	}
+	if volumeName == "" && taskID != "" {
+		if task, err := sm.store.GetTask(taskID); err == nil {
+			volumeName = strings.TrimSpace(task.VolumeName)
+		}
+	}
+	return chapterNo, volumeName, chapterTitle, draftPath
 }
 
 func (sm *SessionManager) inferChapterNumberForSession(taskID string, sess *models.Session) int {
@@ -649,7 +672,7 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 
 	if err := sm.pool.Acquire(ctx); err != nil {
 		logger.Error(logging.ErrTimeout, "pool acquire failed: session=%s err=%v", sessionID, err)
-		sm.appendTaskMessage(taskID, sessionID, "system", "server busy, please retry later", 0)
+		sm.appendTaskMessage(taskID, sessionID, "system", chaterr.UserFacing("server busy, please retry later"), 0)
 		return
 	}
 	defer sm.pool.Release()
@@ -741,8 +764,26 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 		if assistantPersisted {
 			return
 		}
-		chapterNo, chapterTitle := sm.resolveChapterNoticeMeta(taskID, sessionID, sess, sessionDraftPath)
-		display := chatDisplayOrDraftNotice(assistantText.String(), sessionDraftPath, chapterNo, chapterTitle)
+		chapterNo, volumeName, chapterTitle, noticeDraftPath := sm.resolveChapterNoticeMeta(taskID, sessionID, sess, sessionDraftPath)
+		draftWrittenThisTurn := draftWrittenByTool
+		// 任务级对话（sessionID 为空）不与章节 current_draft 关联，避免误用「第 N 章已写好」覆盖真实回复
+		if sessionID != "" {
+			draftWrittenThisTurn = draftWrittenThisTurn ||
+				DraftFileChangedSince(noticeDraftPath, draftBaselineMod, draftBaselineSize)
+		} else {
+			noticeDraftPath = ""
+			chapterNo = 0
+			volumeName = ""
+			chapterTitle = ""
+		}
+		display := chatDisplayOrDraftNotice(
+			assistantText.String(),
+			noticeDraftPath,
+			chapterNo,
+			volumeName,
+			chapterTitle,
+			draftWrittenThisTurn,
+		)
 		if strings.TrimSpace(display) == "" {
 			return
 		}
@@ -785,7 +826,7 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 				continue
 			}
 			logger.Error(logging.ErrSessionError, "opencode launch failed: session=%s err=%v", sessionID, err)
-			errText := fmt.Sprintf("failed to start opencode: %v", err)
+			errText := chaterr.UserFacing(fmt.Sprintf("failed to start opencode: %v", err))
 			sm.appendTaskMessage(taskID, sessionID, "system", errText, 0)
 			return
 		}
@@ -841,16 +882,6 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 				emitDraftUpdated()
 			}
 
-			if evt.Type == "done" || evt.Type == "step_finish" {
-				if strings.TrimSpace(assistantText.String()) != "" {
-					persistAssistantMessage()
-				} else if sessionDraftPath != "" {
-					if info, err := os.Stat(sessionDraftPath); err == nil && info.Size() > 0 {
-						persistAssistantMessage()
-					}
-				}
-			}
-
 			if writeDraftOnText && !draftWrittenByTool && (evt.Type == "step_finish" || evt.Type == "done") && textBuf.Len() > 0 {
 				cwd := sm.store.GetSessionCWDDir(taskID, sessionID)
 				draftPath := filepath.Join(cwd, "current_draft.md")
@@ -872,6 +903,14 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 
 			if evt.Type == "done" {
 				emitDraftUpdated()
+				if strings.TrimSpace(assistantText.String()) != "" {
+					persistAssistantMessage()
+				} else if sessionID != "" {
+					_, _, _, noticeDraftPath := sm.resolveChapterNoticeMeta(taskID, sessionID, sess, sessionDraftPath)
+					if DraftFileChangedSince(noticeDraftPath, draftBaselineMod, draftBaselineSize) {
+						persistAssistantMessage()
+					}
+				}
 			}
 
 			if evt.Type == "done" && !assistantPersisted && strings.TrimSpace(assistantText.String()) == "" {
@@ -893,7 +932,7 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 				evt.Type == "done" || evt.Type == "error" || evt.Type == "draft_updated" ||
 				evt.Type == "reasoning" {
 				if evt.Type == "error" && evt.Error != "" {
-					sm.appendTaskMessage(taskID, sessionID, "system", evt.Error, 0)
+					sm.appendTaskMessage(taskID, sessionID, "system", chaterr.UserFacing(evt.Error), 0)
 				}
 				out := evt
 				if out.Type == "token" {
@@ -1408,6 +1447,11 @@ func (sm *SessionManager) FillSessionsDraftSize(sessions []*models.Session) {
 		draftPath := filepath.Join(s.CWDPath, "current_draft.md")
 		if info, err := os.Stat(draftPath); err == nil {
 			s.DraftSize = info.Size()
+			if info.Size() > 0 {
+				if data, readErr := os.ReadFile(draftPath); readErr == nil {
+					s.ChapterTitle = store.ExtractChapterTitle(string(data))
+				}
+			}
 		}
 	}
 }
