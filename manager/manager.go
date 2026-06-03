@@ -574,7 +574,7 @@ func (sm *SessionManager) Send(ctx context.Context, sessionID string, req models
 
 	go func() {
 		defer sm.releaseTaskRun(taskID)
-		sm.runSessionLoop(context.Background(), sessionID, taskID, sess.CWDPath, sess.Model, req.Text, sess.OpenCodeSID, true)
+		sm.runSessionLoop(context.Background(), sessionID, taskID, sess.CWDPath, sess.Model, req.Text, sess.OpenCodeSID)
 	}()
 
 	return nil
@@ -609,7 +609,7 @@ func (sm *SessionManager) SendTaskMessage(ctx context.Context, taskID string, re
 		ocSID := sm.loadChatOpenCodeSession(cwd)
 		go func() {
 			defer sm.releaseTaskRun(taskID)
-			sm.runSessionLoop(context.Background(), "", taskID, cwd, task.Model, req.Text, ocSID, false)
+			sm.runSessionLoop(context.Background(), "", taskID, cwd, task.Model, req.Text, ocSID)
 		}()
 		return nil
 	}
@@ -659,12 +659,12 @@ func (sm *SessionManager) SendTaskMessage(ctx context.Context, taskID string, re
 
 	go func() {
 		defer sm.releaseTaskRun(taskID)
-		sm.runSessionLoop(context.Background(), targetSessionID, taskID, sess.CWDPath, sess.Model, req.Text, "", false)
+		sm.runSessionLoop(context.Background(), targetSessionID, taskID, sess.CWDPath, sess.Model, req.Text, "")
 	}()
 	return nil
 }
 
-func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID, cwd, model, message, ocSID string, writeDraftOnText bool) {
+func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID, cwd, model, message, ocSID string) {
 	logger := logging.NewLogger("SessionWorker",
 		logging.WithTaskID(taskID),
 		logging.WithSessionID(sessionID),
@@ -706,20 +706,19 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 	}
 
 	opts := runner.RunOptions{
-		CWD:              cwd,
-		Model:            model,
-		SessionID:        ocSID,
-		Message:          message,
-		Timeout:          timeout,
-		ConfigPath:       sm.configPath,
-		DeepseekAPIKey:   apiKey,
-		WriteDraftOnText: writeDraftOnText,
+		CWD:            cwd,
+		Model:          model,
+		SessionID:      ocSID,
+		Message:        message,
+		Timeout:        timeout,
+		ConfigPath:     sm.configPath,
+		DeepseekAPIKey: apiKey,
 	}
 
 	msgCount := 0
 	totalTokens := 0
 	capturedSID := ocSID
-	var textBuf strings.Builder
+	var lastStepReason string
 	var assistantText strings.Builder
 	assistantPersisted := false
 	draftWrittenByTool := false
@@ -800,11 +799,11 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 
 	maxRetries := 5
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		textBuf.Reset()
 		assistantText.Reset()
 		assistantPersisted = false
 		noContentDetected = false
 		draftWrittenByTool = false
+		lastStepReason = ""
 		evtCountStepStart = 0
 		evtCountToken = 0
 		evtCountToolCall = 0
@@ -858,9 +857,12 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 				evtCountOther++
 			}
 
+			if evt.Type == "step_finish" && evt.Reason != "" {
+				lastStepReason = evt.Reason
+			}
+
 			if evt.Type == "token" || (evt.Type == "step_finish" && strings.TrimSpace(evt.Text) != "") {
 				if evt.Text != "" {
-					textBuf.WriteString(evt.Text)
 					assistantText.WriteString(evt.Text)
 				}
 			}
@@ -882,25 +884,6 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 				emitDraftUpdated()
 			}
 
-			if writeDraftOnText && !draftWrittenByTool && (evt.Type == "step_finish" || evt.Type == "done") && textBuf.Len() > 0 {
-				cwd := sm.store.GetSessionCWDDir(taskID, sessionID)
-				draftPath := filepath.Join(cwd, "current_draft.md")
-				newContent := []byte(textBuf.String())
-				write := true
-				if existing, err := os.ReadFile(draftPath); err == nil && len(existing) > len(newContent) {
-					write = false
-				}
-				if write {
-					if err := os.WriteFile(draftPath, newContent, 0644); err == nil {
-						if draftSess, getErr := sm.store.GetSession(taskID, sessionID); getErr == nil && draftSess.Status == models.StatusGenerating {
-							draftSess.Status = models.StatusDraftReady
-							_ = sm.store.UpsertSessionInTask(draftSess)
-							logger.Info("status changed: GENERATING -> DRAFT_READY: session=%s draft=%d bytes", sessionID, len(newContent))
-						}
-					}
-				}
-			}
-
 			if evt.Type == "done" {
 				emitDraftUpdated()
 				if strings.TrimSpace(assistantText.String()) != "" {
@@ -913,19 +896,11 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 				}
 			}
 
-			if evt.Type == "done" && !assistantPersisted && strings.TrimSpace(assistantText.String()) == "" {
-				draftExists := false
-				if sessionDraftPath != "" {
-					if info, err := os.Stat(sessionDraftPath); err == nil && info.Size() > 0 {
-						draftExists = true
-					}
-				}
-				if !draftExists {
-					noContentDetected = true
-					logger.Warn(logging.WarnProcessStuck, "opencode returned no content: session=%s task=%s model=%s text_buf_len=%d total_tokens=%d msg_count=%d events(step_start=%d token=%d tool_call=%d step_finish=%d reasoning=%d draft_updated=%d error=%d other=%d)",
-						sessionID, taskID, model, textBuf.Len(), totalTokens, msgCount,
-						evtCountStepStart, evtCountToken, evtCountToolCall, evtCountStepFinish, evtCountReasoning, evtCountDraftUpdated, evtCountError, evtCountOther)
-				}
+			if evt.Type == "done" && !draftWrittenByTool {
+				noContentDetected = true
+				logger.Warn(logging.WarnProcessStuck, "opencode returned no content (no draft written via tool): session=%s task=%s model=%s last_step_reason=%s total_tokens=%d msg_count=%d events(step_start=%d tool_call=%d step_finish=%d reasoning=%d draft_updated=%d error=%d other=%d)",
+					sessionID, taskID, model, lastStepReason, totalTokens, msgCount,
+					evtCountStepStart, evtCountToolCall, evtCountStepFinish, evtCountReasoning, evtCountDraftUpdated, evtCountError, evtCountOther)
 			}
 
 			if evt.Type == "token" || evt.Type == "tool_call" || evt.Type == "step_finish" ||
@@ -935,12 +910,8 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 					sm.appendTaskMessage(taskID, sessionID, "system", chaterr.UserFacing(evt.Error), 0)
 				}
 				out := evt
-				if out.Type == "token" {
-					if writeDraftOnText {
-						out.Text = ""
-					} else if out.Text != "" {
-						out.Text = chatDisplayTextDelta(assistantText.String(), sessionDraftPath, out.Text)
-					}
+				if out.Type == "token" && out.Text != "" {
+					out.Text = chatDisplayTextDelta(assistantText.String(), sessionDraftPath, out.Text)
 				}
 				if out.Type == "step_finish" && out.Text != "" {
 					out.Text = ChatDisplayText(out.Text, sessionDraftPath)
@@ -1047,7 +1018,7 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 		if info, err := os.Stat(draftPath); err == nil {
 			logger.Info("draft file exists: session=%s path=%s size=%d bytes", sessionID, draftPath, info.Size())
 		} else {
-			logger.Warn(logging.WarnProcessStuck, "draft file not found: session=%s path=%s assistant_persisted=%v text_buf_len=%d", sessionID, draftPath, assistantPersisted, textBuf.Len())
+			logger.Warn(logging.WarnProcessStuck, "draft file not found: session=%s path=%s assistant_persisted=%v", sessionID, draftPath, assistantPersisted)
 		}
 	}
 
@@ -1422,7 +1393,7 @@ func (sm *SessionManager) WakeTask(ctx context.Context, taskID string, req model
 		msg = adapter.BuildStartMessage(novelName, skill, req.Text, chapterNum)
 	}
 
-	go sm.runSessionLoop(context.Background(), sessionID, taskID, cwd, model, msg, "", true)
+	go sm.runSessionLoop(context.Background(), sessionID, taskID, cwd, model, msg, "")
 
 	return sess, nil
 }

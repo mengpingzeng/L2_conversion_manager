@@ -54,14 +54,13 @@ func NewOpenCodeRunner(binaryPath string) *OpenCodeRunner {
 }
 
 type RunOptions struct {
-	CWD              string
-	Model            string
-	SessionID        string
-	Message          string
-	Timeout          time.Duration
-	ConfigPath       string
-	DeepseekAPIKey   string
-	WriteDraftOnText bool
+	CWD            string
+	Model          string
+	SessionID      string
+	Message        string
+	Timeout        time.Duration
+	ConfigPath     string
+	DeepseekAPIKey string
 }
 
 func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan models.SessionEvent, error) {
@@ -237,6 +236,7 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 					evt := models.SessionEvent{
 						Type:      "step_finish",
 						SessionID: capturedSID,
+						Reason:    raw.Part.Reason,
 					}
 					if raw.Part.Tokens.Total > 0 {
 						evt.Tokens = &models.TokenInfo{
