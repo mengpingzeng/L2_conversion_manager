@@ -1,10 +1,13 @@
 package manager
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -717,6 +720,7 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 
 	msgCount := 0
 	totalTokens := 0
+	apiEverResponded := false
 	capturedSID := ocSID
 	var lastStepReason string
 	var assistantText strings.Builder
@@ -857,9 +861,12 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 				evtCountOther++
 			}
 
-			if evt.Type == "step_finish" && evt.Reason != "" {
-				lastStepReason = evt.Reason
-			}
+		if evt.Type == "reasoning" || (evt.Type == "step_finish" && evt.Reason != "") {
+			apiEverResponded = true
+		}
+		if evt.Type == "step_finish" && evt.Reason != "" {
+			lastStepReason = evt.Reason
+		}
 
 			if evt.Type == "token" || (evt.Type == "step_finish" && strings.TrimSpace(evt.Text) != "") {
 				if evt.Text != "" {
@@ -896,7 +903,7 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 				}
 			}
 
-			if evt.Type == "done" && !draftWrittenByTool {
+			if (evt.Type == "done" || evt.Type == "error") && !draftWrittenByTool {
 				noContentDetected = true
 				logger.Warn(logging.WarnProcessStuck, "opencode returned no content (no draft written via tool): session=%s task=%s model=%s last_step_reason=%s total_tokens=%d msg_count=%d events(step_start=%d tool_call=%d step_finish=%d reasoning=%d draft_updated=%d error=%d other=%d)",
 					sessionID, taskID, model, lastStepReason, totalTokens, msgCount,
@@ -931,7 +938,20 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 	}
 
 	if noContentDetected {
-		sm.appendTaskMessage(taskID, sessionID, "system", "AI 未返回内容，请重试", 0)
+		msg := "AI 未返回内容，请重试"
+		if !apiEverResponded && apiKey != "" {
+			logger.Info("key validation: no API response in any attempt, checking key...")
+			vCtx, vCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			if vErr := validateDeepseekKey(vCtx, apiKey); vErr != nil {
+				msg = fmt.Sprintf("API key 无效 (%v)，请检查 key 配置是否过期或额度不足", vErr)
+				logger.Error(logging.ErrSessionError, "API key validation failed: session=%s err=%v", sessionID, vErr)
+			} else {
+				msg = "AI 未返回内容（key 有效，可能是步配额耗尽），请重试"
+				logger.Info("key validation passed: session=%s (key valid)", sessionID)
+			}
+			vCancel()
+		}
+		sm.appendTaskMessage(taskID, sessionID, "system", msg, 0)
 	}
 
 	if sessionID != "" {
@@ -1638,4 +1658,40 @@ func (sm *SessionManager) inferChapterNumber(taskID string) int {
 		return len(sessions)
 	}
 	return 1
+}
+
+func validateDeepseekKey(ctx context.Context, apiKey string) error {
+	body, _ := json.Marshal(map[string]interface{}{
+		"model": "deepseek-chat",
+		"messages": []map[string]string{
+			{"role": "user", "content": "hi"},
+		},
+		"max_tokens": 1,
+	})
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.deepseek.com/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create validation request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("API unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		return fmt.Errorf("HTTP %d (auth failed)", resp.StatusCode)
+	}
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("HTTP %d (server error)", resp.StatusCode)
+	}
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	return nil
 }
