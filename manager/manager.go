@@ -723,9 +723,9 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 	apiEverResponded := false
 	capturedSID := ocSID
 	var lastStepReason string
+	var draftSizeFromDone int64
 	var assistantText strings.Builder
 	assistantPersisted := false
-	draftWrittenByTool := false
 	var evtCountStepStart, evtCountToken, evtCountToolCall, evtCountStepFinish, evtCountReasoning, evtCountDraftUpdated, evtCountError, evtCountOther int
 	noContentDetected := false
 	sessionDraftPath := ""
@@ -768,16 +768,13 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 			return
 		}
 		chapterNo, volumeName, chapterTitle, noticeDraftPath := sm.resolveChapterNoticeMeta(taskID, sessionID, sess, sessionDraftPath)
-		draftWrittenThisTurn := draftWrittenByTool
-		// 任务级对话（sessionID 为空）不与章节 current_draft 关联，避免误用「第 N 章已写好」覆盖真实回复
-		if sessionID != "" {
-			draftWrittenThisTurn = draftWrittenThisTurn ||
-				DraftFileChangedSince(noticeDraftPath, draftBaselineMod, draftBaselineSize)
-		} else {
+		draftWrittenThisTurn := DraftFileChangedSince(noticeDraftPath, draftBaselineMod, draftBaselineSize)
+		if sessionID == "" {
 			noticeDraftPath = ""
 			chapterNo = 0
 			volumeName = ""
 			chapterTitle = ""
+			draftWrittenThisTurn = false
 		}
 		display := chatDisplayOrDraftNotice(
 			assistantText.String(),
@@ -806,7 +803,7 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 		assistantText.Reset()
 		assistantPersisted = false
 		noContentDetected = false
-		draftWrittenByTool = false
+		draftSizeFromDone = 0
 		lastStepReason = ""
 		evtCountStepStart = 0
 		evtCountToken = 0
@@ -886,29 +883,27 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 				totalTokens += evt.Tokens.Total
 			}
 
-			if evt.Type == "tool_call" && evt.DraftPath != "" && (evt.ToolResult != "" || isWriteToolName(evt.Tool)) {
-				draftWrittenByTool = true
-				emitDraftUpdated()
+		if evt.Type == "done" {
+			emitDraftUpdated()
+			if evt.DraftSize > 0 {
+				draftSizeFromDone = evt.DraftSize
 			}
-
-			if evt.Type == "done" {
-				emitDraftUpdated()
-				if strings.TrimSpace(assistantText.String()) != "" {
+			if strings.TrimSpace(assistantText.String()) != "" {
+				persistAssistantMessage()
+			} else if sessionID != "" {
+				_, _, _, noticeDraftPath := sm.resolveChapterNoticeMeta(taskID, sessionID, sess, sessionDraftPath)
+				if DraftFileChangedSince(noticeDraftPath, draftBaselineMod, draftBaselineSize) {
 					persistAssistantMessage()
-				} else if sessionID != "" {
-					_, _, _, noticeDraftPath := sm.resolveChapterNoticeMeta(taskID, sessionID, sess, sessionDraftPath)
-					if DraftFileChangedSince(noticeDraftPath, draftBaselineMod, draftBaselineSize) {
-						persistAssistantMessage()
-					}
 				}
 			}
+		}
 
-			if (evt.Type == "done" || evt.Type == "error") && !draftWrittenByTool {
-				noContentDetected = true
-				logger.Warn(logging.WarnProcessStuck, "opencode returned no content (no draft written via tool): session=%s task=%s model=%s last_step_reason=%s total_tokens=%d msg_count=%d events(step_start=%d tool_call=%d step_finish=%d reasoning=%d draft_updated=%d error=%d other=%d)",
-					sessionID, taskID, model, lastStepReason, totalTokens, msgCount,
-					evtCountStepStart, evtCountToolCall, evtCountStepFinish, evtCountReasoning, evtCountDraftUpdated, evtCountError, evtCountOther)
-			}
+		if (evt.Type == "done" || evt.Type == "error") && draftSizeFromDone == 0 {
+			noContentDetected = true
+			logger.Warn(logging.WarnProcessStuck, "opencode returned no content (draft_size=0): session=%s task=%s model=%s last_step_reason=%s total_tokens=%d msg_count=%d events(step_start=%d tool_call=%d step_finish=%d reasoning=%d draft_updated=%d error=%d other=%d)",
+				sessionID, taskID, model, lastStepReason, totalTokens, msgCount,
+				evtCountStepStart, evtCountToolCall, evtCountStepFinish, evtCountReasoning, evtCountDraftUpdated, evtCountError, evtCountOther)
+		}
 
 			if evt.Type == "token" || evt.Type == "tool_call" || evt.Type == "step_finish" ||
 				evt.Type == "done" || evt.Type == "error" || evt.Type == "draft_updated" ||

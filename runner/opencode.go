@@ -216,14 +216,13 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 						Text:      raw.Part.Text,
 					})
 
-				case "tool_use":
-					w.send(models.SessionEvent{
-						Type:       "tool_call",
-						SessionID:  capturedSID,
-						Tool:       raw.Part.Tool,
-						ToolResult: raw.Part.State.Output,
-						DraftPath:  extractDraftPath(raw.Part.State.Input),
-					})
+			case "tool_use":
+				w.send(models.SessionEvent{
+					Type:       "tool_call",
+					SessionID:  capturedSID,
+					Tool:       raw.Part.Tool,
+					ToolResult: raw.Part.State.Output,
+				})
 
 				case "text":
 					w.send(models.SessionEvent{
@@ -297,6 +296,25 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 		if st, err := os.Stat(draftPath); err == nil {
 			draftSize = st.Size()
 		}
+
+		if draftSize == 0 {
+			parentDraftPath := filepath.Join(filepath.Dir(opts.CWD), "current_draft.md")
+			if st, err := os.Stat(parentDraftPath); err == nil && st.Size() > 0 {
+				logger.Warn(logging.WarnProcessStuck,
+					"misplaced draft detected, moving: from=%s to=%s size=%d",
+					parentDraftPath, draftPath, st.Size())
+				if data, err := os.ReadFile(parentDraftPath); err == nil {
+					if err := os.WriteFile(draftPath, data, 0644); err == nil {
+						draftSize = st.Size()
+						_ = os.Remove(parentDraftPath)
+					} else {
+						logger.Warn(logging.WarnProcessStuck,
+							"failed to copy misplaced draft: from=%s err=%v", parentDraftPath, err)
+					}
+				}
+			}
+		}
+
 		logger.Info("opencode done: pid=%d duration=%s draft_size=%d had_error=%v exit_code=%d stdout_lines=%d stderr_bytes=%d",
 			cmd.Process.Pid, duration, draftSize, hadError, exitCode, stdoutLineCount, len(stderrData))
 
@@ -311,27 +329,12 @@ func (r *OpenCodeRunner) Run(ctx context.Context, opts RunOptions) (<-chan model
 			w.send(models.SessionEvent{
 				Type:      "done",
 				SessionID: capturedSID,
+				DraftSize: draftSize,
 			})
 		}
 	}()
 
 	return events, nil
-}
-
-func extractDraftPath(input json.RawMessage) string {
-	if len(input) == 0 {
-		return ""
-	}
-	var args struct {
-		FilePath string `json:"filePath"`
-	}
-	if err := json.Unmarshal(input, &args); err != nil {
-		return ""
-	}
-	if args.FilePath != "" && strings.HasSuffix(args.FilePath, "current_draft.md") {
-		return args.FilePath
-	}
-	return ""
 }
 
 func cleanEnv(env []string) []string {

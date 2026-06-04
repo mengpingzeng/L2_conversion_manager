@@ -265,6 +265,7 @@ func BuildStartMessage(novelName string, skill SkillDef, userText string, chapte
 
 	sb.WriteString("## 硬性约束（最重要！）\n\n")
 	sb.WriteString("1. 回复完成后，你必须使用 write 工具将完整内容写入 current_draft.md 文件\n")
+	sb.WriteString("   ⚠️ 使用相对路径 \"current_draft.md\" （当前工作目录下），禁止使用绝对路径\n")
 	sb.WriteString("2. 章节标题使用 Markdown 一级标题写在 current_draft.md 最开头\n")
 	sb.WriteString("3. 正文开头不允许出现章节标题（如'第X章 XXX'）\n\n")
 
