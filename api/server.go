@@ -59,6 +59,7 @@ func (s *Server) registerRoutes() {
 	api.HandleFunc("/session/{id}/send", s.handleSend).Methods("POST")
 	api.HandleFunc("/session/{id}/close", s.handleClose).Methods("POST")
 	api.HandleFunc("/session/{id}", s.handleGetSession).Methods("GET")
+	api.HandleFunc("/session/{id}/alive", s.handleSessionAlive).Methods("GET")
 	api.HandleFunc("/session/{id}/draft", s.handleGetDraft).Methods("GET")
 
 	api.HandleFunc("/sessions", s.handleListSessions).Methods("GET")
@@ -613,6 +614,15 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, 200, sess)
+}
+
+func (s *Server) handleSessionAlive(w http.ResponseWriter, r *http.Request) {
+	sessionID := mux.Vars(r)["id"]
+	alive := s.sm.IsSessionRunning(sessionID)
+	writeJSON(w, 200, map[string]interface{}{
+		"session_id": sessionID,
+		"alive":      alive,
+	})
 }
 
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {

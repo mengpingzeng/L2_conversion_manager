@@ -71,6 +71,9 @@ type SessionManager struct {
 
 	taskRunGates sync.Map // taskID -> *taskRunGate
 
+	runningSessions   map[string]bool
+	runningSessionsMu sync.Mutex
+
 	stopCh chan struct{}
 }
 
@@ -135,6 +138,7 @@ func New(cfg Config) (*SessionManager, error) {
 		skills:           skills,
 		skillRegistryURL: cfg.SkillRegistryURL,
 		fetchedSkills:    make(map[string]adapter.SkillDef),
+		runningSessions:  make(map[string]bool),
 		stopCh:           make(chan struct{}),
 	}
 
@@ -149,6 +153,12 @@ func New(cfg Config) (*SessionManager, error) {
 
 func (sm *SessionManager) Stop() {
 	close(sm.stopCh)
+}
+
+func (sm *SessionManager) IsSessionRunning(sessionID string) bool {
+	sm.runningSessionsMu.Lock()
+	defer sm.runningSessionsMu.Unlock()
+	return sm.runningSessions[sessionID]
 }
 
 func (sm *SessionManager) ListTaskSkillIDs() []string {
@@ -672,6 +682,17 @@ func (sm *SessionManager) runSessionLoop(ctx context.Context, sessionID, taskID,
 		logging.WithTaskID(taskID),
 		logging.WithSessionID(sessionID),
 	)
+
+	if sessionID != "" {
+		sm.runningSessionsMu.Lock()
+		sm.runningSessions[sessionID] = true
+		sm.runningSessionsMu.Unlock()
+		defer func() {
+			sm.runningSessionsMu.Lock()
+			delete(sm.runningSessions, sessionID)
+			sm.runningSessionsMu.Unlock()
+		}()
+	}
 
 	if err := sm.pool.Acquire(ctx); err != nil {
 		logger.Error(logging.ErrTimeout, "pool acquire failed: session=%s err=%v", sessionID, err)
