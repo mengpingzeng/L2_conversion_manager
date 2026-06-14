@@ -1647,6 +1647,32 @@ func (sm *SessionManager) DeleteTask(taskID string) error {
 	return sm.store.DeleteTask(taskID)
 }
 
+func (sm *SessionManager) DeleteSession(sessionID string) error {
+	_, taskID, err := sm.findSession(sessionID)
+	if err != nil {
+		return err
+	}
+
+	task, err := sm.store.GetTask(taskID)
+	if err != nil {
+		return err
+	}
+
+	newIDs := make([]string, 0, len(task.SessionIDs))
+	for _, sid := range task.SessionIDs {
+		if sid != sessionID {
+			newIDs = append(newIDs, sid)
+		}
+	}
+	task.SessionIDs = newIDs
+	task.SessionCount = len(newIDs)
+	if err := sm.store.UpdateTask(task); err != nil {
+		return err
+	}
+
+	return sm.store.DeleteSession(taskID, sessionID)
+}
+
 func (sm *SessionManager) CreateTaskDirect(req models.CreateTaskRequest) error {
 	_, _, err := sm.store.GetOrCreateTask(req.TaskID, req.Topic, req.UID, "", req.Platform, req.SkillID, req.Model, req.AccountID, req.NovelName)
 	return err

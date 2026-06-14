@@ -61,6 +61,7 @@ func (s *Server) registerRoutes() {
 	api.HandleFunc("/session/{id}", s.handleGetSession).Methods("GET")
 	api.HandleFunc("/session/{id}/alive", s.handleSessionAlive).Methods("GET")
 	api.HandleFunc("/session/{id}/draft", s.handleGetDraft).Methods("GET")
+	api.HandleFunc("/session/{id}", s.handleSessionDelete).Methods("DELETE")
 
 	api.HandleFunc("/sessions", s.handleListSessions).Methods("GET")
 
@@ -622,6 +623,24 @@ func (s *Server) handleSessionAlive(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{
 		"session_id": sessionID,
 		"alive":      alive,
+	})
+}
+
+func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
+	logger := logging.FromContext(r.Context())
+	sessionID := mux.Vars(r)["id"]
+
+	if err := s.sm.DeleteSession(sessionID); err != nil {
+		if logger != nil {
+			logger.Error(logging.ErrDatabaseError, "DeleteSession(%s) failed: %v", sessionID, err)
+		}
+		writeError(w, 500, "failed to delete session: "+err.Error())
+		return
+	}
+
+	writeJSON(w, 200, map[string]string{
+		"session_id": sessionID,
+		"status":     "deleted",
 	})
 }
 

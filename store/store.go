@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -227,6 +228,42 @@ func (s *Store) DeleteTask(taskID string) error {
 	// 删除任务目录（包含 sessions、drafts 等）
 	taskDir := filepath.Join(s.dataDir, "tasks", taskID)
 	_ = os.RemoveAll(taskDir)
+	return nil
+}
+
+func (s *Store) DeleteSession(taskID, sessionID string) error {
+	path := s.TaskSessionsFile(taskID)
+	var sessions []*models.Session
+
+	data, err := os.ReadFile(path)
+	if err == nil {
+		_ = json.Unmarshal(data, &sessions)
+	}
+	if sessions == nil {
+		sessions = []*models.Session{}
+	}
+
+	filtered := make([]*models.Session, 0, len(sessions))
+	for _, sess := range sessions {
+		if sess.SessionID != sessionID {
+			filtered = append(filtered, sess)
+		}
+	}
+
+	if err := s.SaveTaskSessions(taskID, filtered); err != nil {
+		return err
+	}
+
+	sessionDir := s.GetSessionDir(taskID, sessionID)
+	_ = os.RemoveAll(sessionDir)
+
+	skillDir := filepath.Join(s.skillsDir, "skill_"+sessionID)
+	_ = os.RemoveAll(skillDir)
+
+	if err := s.UpdateShortTerm(taskID, filtered); err != nil {
+		log.Printf("WARN: DeleteSession update short_term failed task=%s sid=%s: %v", taskID, sessionID, err)
+	}
+
 	return nil
 }
 
